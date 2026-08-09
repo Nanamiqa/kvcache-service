@@ -30,6 +30,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(completion.status_code, 200)
         self.assertEqual(completion.json()["choices"][0]["text"], "done")
         self.assertEqual(completion.json()["usage"]["cached_tokens"], 8)
+        self.assertEqual(completion.json()["timings_ms"]["total"], 6.5)
+
+        stats = self.client.get("/v1/kv-caches/stats")
+        self.assertEqual(stats.status_code, 200)
+        self.assertEqual(stats.json()["cache_count"], 0)
 
         deleted = self.client.delete(f"/v1/kv-caches/{cache_id}")
         self.assertTrue(deleted.json()["deleted"])
@@ -37,6 +42,13 @@ class ApiTest(unittest.TestCase):
     def test_rejects_ambiguous_cache_input(self) -> None:
         response = self.client.post("/v1/kv-caches", json={"text": "a", "input_ids": [1, 2]})
         self.assertEqual(response.status_code, 422)
+
+    def test_optional_api_key_protects_v1_routes(self) -> None:
+        protected = TestClient(create_app(Settings(api_key="test-secret"), FakeBackend()))
+        self.assertEqual(protected.get("/health").status_code, 200)
+        self.assertEqual(protected.get("/v1/models").status_code, 401)
+        authorized = protected.get("/v1/models", headers={"Authorization": "Bearer test-secret"})
+        self.assertEqual(authorized.status_code, 200)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -39,6 +39,7 @@ class CacheInfoResponse(StrictModel):
     tensor_bytes: int
     created_at: str
     chunk_size: int
+    expires_at: Optional[str] = None
 
 
 class CacheListResponse(StrictModel):
@@ -58,6 +59,13 @@ class CompletionRequest(StrictModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stop_token_ids: List[int] = Field(default_factory=list)
+    prompt_mode: Literal["suffix", "full"] = Field(
+        default="suffix",
+        description=(
+            "suffix means prompt/input_ids only contains uncached tokens; full means it contains "
+            "the cached prefix too and the server verifies/removes that exact token prefix"
+        ),
+    )
     stream: bool = False
 
     @model_validator(mode="after")
@@ -103,6 +111,7 @@ class CompletionResponse(StrictModel):
     choices: List[CompletionChoice]
     usage: Usage
     kv_cache_id: Optional[str] = None
+    timings_ms: Dict[str, float]
 
 
 class ModelItem(StrictModel):
@@ -120,3 +129,17 @@ class DeleteResponse(StrictModel):
     id: str
     object: str = "kv_cache"
     deleted: bool
+
+
+class CacheStoreStatsResponse(StrictModel):
+    cache_count: int
+    tensor_bytes: int
+    disk_bytes: int
+    max_store_bytes: int
+    ttl_seconds: int
+
+
+class CachePruneResponse(StrictModel):
+    removed_count: int
+    freed_bytes: int
+    stats: CacheStoreStatsResponse

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from kvcache_service.config import Settings
 from kvcache_service.domain import BuildCacheCommand, CompletionCommand
+from kvcache_service.errors import CacheCompatibilityError
 from kvcache_service.store import SafeTensorCacheStore
 from kvcache_service.transformers_backend import TransformersBackend
 
@@ -67,6 +68,7 @@ class TransformersBackendTest(unittest.TestCase):
         self.assertEqual(result.cached_tokens, info.token_count)
         self.assertEqual(result.prompt_tokens, info.token_count + 1)
         self.assertEqual(len(result.token_ids), 3)
+        self.assertGreaterEqual(result.timings_ms["total"], result.timings_ms["decode"])
 
     def test_build_is_content_addressed_and_idempotent(self) -> None:
         command = BuildCacheCommand(text="same", input_ids=None, chunk_size=2)
@@ -74,6 +76,88 @@ class TransformersBackendTest(unittest.TestCase):
         second = self.backend.build_cache(command)
         self.assertEqual(first.cache_id, second.cache_id)
         self.assertEqual(len(self.backend.list_caches()), 1)
+
+    def test_full_prompt_mode_verifies_and_removes_cached_prefix(self) -> None:
+        info = self.backend.build_cache(BuildCacheCommand(text="abc", input_ids=None, chunk_size=2))
+        result = self.backend.complete(
+            CompletionCommand(
+                cache_id=info.cache_id,
+                prompt="abcXYZ",
+                input_ids=None,
+                max_tokens=2,
+                temperature=0,
+                top_p=1,
+                top_k=0,
+                seed=7,
+                stop=[],
+                stop_token_ids=[],
+                prompt_mode="full",
+            )
+        )
+        self.assertEqual(result.prompt_tokens, info.token_count + 3)
+
+        with self.assertRaises(CacheCompatibilityError):
+            self.backend.complete(
+                CompletionCommand(
+                    cache_id=info.cache_id,
+                    prompt="xbcXYZ",
+                    input_ids=None,
+                    max_tokens=2,
+                    temperature=0,
+                    top_p=1,
+                    top_k=0,
+                    seed=7,
+                    stop=[],
+                    stop_token_ids=[],
+                    prompt_mode="full",
+                )
+            )
+
+    def test_can_generate_directly_from_prefix_without_suffix(self) -> None:
+        info = self.backend.build_cache(BuildCacheCommand(text="abc", input_ids=None, chunk_size=2))
+        result = self.backend.complete(
+            CompletionCommand(
+                cache_id=info.cache_id,
+                prompt=None,
+                input_ids=None,
+                max_tokens=1,
+                temperature=0,
+                top_p=1,
+                top_k=0,
+                seed=None,
+                stop=[],
+                stop_token_ids=[],
+            )
+        )
+        self.assertEqual(result.prompt_tokens, info.token_count)
+
+    def test_explicit_model_fingerprint_invalidates_old_cache(self) -> None:
+        first_settings = Settings(
+            model_id="fake/model",
+            model_revision="mutable",
+            model_fingerprint="release-a",
+            device="cpu",
+            store_dir=Path(self.temporary.name),
+            max_context_tokens=128,
+        )
+        second_settings = Settings(
+            model_id="fake/model",
+            model_revision="mutable",
+            model_fingerprint="release-b",
+            device="cpu",
+            store_dir=Path(self.temporary.name),
+            max_context_tokens=128,
+        )
+        first_backend = TransformersBackend(
+            first_settings, model=FakeCausalLM(self.torch), tokenizer=FakeTokenizer()
+        )
+        second_backend = TransformersBackend(
+            second_settings, model=FakeCausalLM(self.torch), tokenizer=FakeTokenizer()
+        )
+        command = BuildCacheCommand(text="same", input_ids=None, chunk_size=2)
+        first = first_backend.build_cache(command)
+        second = second_backend.build_cache(command)
+        self.assertNotEqual(first.cache_id, second.cache_id)
 
 
 if __name__ == "__main__":

@@ -130,4 +130,11 @@ class FakeBackend(KVCacheBackend):
             prompt_tokens=10,
             cached_tokens=8 if command.cache_id else 0,
             finish_reason="length",
+            timings_ms={
+                "cache_load": 1.0,
+                "input_processing": 0.5,
+                "prefill": 2.0,
+                "decode": 3.0,
+                "total": 6.5,
+            },
         )

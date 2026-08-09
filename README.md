@@ -7,6 +7,9 @@ prefill，将每层 Key/Value 张量安全落盘，并在后续请求中跳过�
 当前版本是可运行的单机参考实现，同时保留了 backend 插件边界。生产环境中需要高并发、
 多 GPU、分层存储或自动前缀匹配时，建议使用仓库内给出的 vLLM + LMCache 方案。
 
+0.2 版补齐了服务化必需能力：跨进程存储锁、TTL/LRU 容量治理、可选 API Key、完整
+prompt 的精确 token 前缀验证、分阶段耗时，以及 Docker、CI 和基准脚本。
+
 ## 先说结论
 
 这个目标可以实现，但有几个不能绕过的边界：
@@ -66,6 +69,15 @@ kvcache-server
 Hugging Face 下载模型；私有环境可把 `KVCACHE_MODEL` 指向本地模型目录，并设置
 `KVCACHE_LOCAL_FILES_ONLY=true`。
 
+也可以启动 CPU 演示容器：
+
+```bash
+docker compose up --build
+```
+
+GPU 生产镜像应改用与宿主 CUDA 匹配的 PyTorch/vLLM 基础镜像，不要直接使用这个 CPU
+演示镜像。
+
 ### 1. 分块解析并存储公共前缀
 
 ```bash
@@ -96,9 +108,24 @@ curl -X POST http://localhost:8080/v1/completions \
 `usage.cached_tokens` 是跳过 prefill 的前缀 token 数。也可不传 `kv_cache_id`，此时接口
 退化成普通 completion。
 
+响应中的 `timings_ms` 分别给出 `cache_load`、`input_processing`、`prefill`、`decode` 和
+端到端 `total`，可直接用于判断磁盘加载是否抵消了 prefill 收益。
+
 对 token 边界有严格要求时，构建和调用都传 `input_ids`。分别 tokenizer.encode
 `prefix` 与 `suffix` 可能和一次性编码 `prefix + suffix` 不完全相同，尤其是前缀没有以空格、
 换行或模板边界结尾时。
+
+如果调用方手里是完整 prompt 而不是后缀，可使用 `prompt_mode=full`。服务端会重新分词、
+逐 token 验证缓存前缀，再只计算新增部分；不匹配会返回 `409 cache_incompatible`：
+
+```json
+{
+  "kv_cache_id": "<cache_id>",
+  "prompt": "<原始完整前缀>请概括上面的内容。",
+  "prompt_mode": "full",
+  "max_tokens": 128
+}
+```
 
 ## API
 
@@ -108,6 +135,8 @@ curl -X POST http://localhost:8080/v1/completions \
 | `GET` | `/v1/models` | OpenAI 风格模型列表 |
 | `POST` | `/v1/kv-caches` | 分块 prefill 并持久化 |
 | `GET` | `/v1/kv-caches` | 列出缓存 |
+| `GET` | `/v1/kv-caches/stats` | 缓存数量、逻辑/磁盘字节数和治理配置 |
+| `POST` | `/v1/kv-caches/prune` | 立即清理过期或超出容量的 LRU 缓存 |
 | `GET` | `/v1/kv-caches/{id}` | 读取元数据 |
 | `DELETE` | `/v1/kv-caches/{id}` | 删除缓存 |
 | `POST` | `/v1/completions` | 普通生成或从缓存继续生成 |
@@ -126,13 +155,21 @@ data/kv-cache/<cache_id>/
 
 - `safetensors` 避免反序列化任意 Python 对象。
 - 临时目录写完后原子发布，避免请求读到半成品。
-- 加载时默认校验 tensor 文件 SHA-256。
+- 加载时默认校验 tensor 文件 SHA-256；同一进程内会记住已验证文件的 size/mtime，文件未变
+  时不重复扫描数 GiB 的缓存，文件发生变化后会自动重新校验。
 - metadata 保存模型指纹、前缀 token hash、层数、dtype 和体积。
 - tensor 文件包含每层 K/V、精确 prefix token IDs，以及“前缀结束后下一 token”的 logits，
   因而即使 suffix 为空也能继续生成。
+- 进程内锁与文件锁共同保护读、写、删，允许同一缓存目录被多个 worker 安全使用。
+- 实际加载会刷新目录访问时间；容量超过 `KVCACHE_MAX_STORE_BYTES` 时按 LRU 淘汰，TTL
+  到期缓存由读请求或 prune 清理。单个新缓存大于总配额时会保留该缓存并在 stats 中反映
+  超额，避免刚构建成功就返回一个失效 ID。
 
 KV 和 token IDs 都应按原始提示词同等级别保护。目录不应放在公开对象存储中，也不应跨
 租户共享；生产环境应补充磁盘加密、租户 namespace、访问控制和 TTL/LRU 淘汰。
+
+设置 `KVCACHE_API_KEY` 后，所有 `/v1/*` 路由都要求
+`Authorization: Bearer <key>` 或 `X-API-Key: <key>`；`/health` 保持公开，便于编排系统探活。
 
 ## 配置
 
@@ -141,9 +178,17 @@ KV 和 token IDs 都应按原始提示词同等级别保护。目录不应放在
 - `KVCACHE_MODEL`：Hugging Face 模型 ID 或本地目录。
 - `KVCACHE_DEVICE`：`auto`、`cpu`、`cuda`、`mps` 等。
 - `KVCACHE_DTYPE`：`auto`、`float16`、`bfloat16`、`float32` 等。
+- `KVCACHE_MODEL_FINGERPRINT`：部署方提供的不可变权重标识；本地可变权重强烈建议设置。
 - `KVCACHE_STORE_DIR`：缓存根目录。
+- `KVCACHE_CACHE_TTL_SECONDS`：缓存有效期；`0` 表示不自动过期。
+- `KVCACHE_MAX_STORE_BYTES`：缓存目录容量上限；`0` 表示不限制。
 - `KVCACHE_MAX_CONTEXT_TOKENS`：显式覆盖模型 context window；`0` 表示从 config 读取。
 - `KVCACHE_BACKEND`：`transformers` 或 `python.module:factory`。
+- `KVCACHE_API_KEY`：可选 API 鉴权密钥。
+
+Hub 模型优先使用已解析 commit 作为模型来源标识；本地目录会对配置、tokenizer/remote code
+内容以及权重文件清单做指纹。若权重会被原地覆盖，务必通过
+`KVCACHE_MODEL_FINGERPRINT` 传入发布版本或完整权重 hash，确保旧 KV 不会被误用。
 
 当前 Transformers backend 有意限制为 batch=1、decoder-only、完整 Dynamic/legacy K/V
 layout，并用进程内锁串行访问单个模型。滑动窗口、hybrid attention、Mamba/线性 attention、
@@ -184,4 +229,14 @@ kvcache-server
 ```bash
 pip install -e '.[dev]'
 pytest
+```
+
+仓库包含 GitHub Actions，会执行 Ruff、14 项单元/集成测试和 wheel 构建。测试覆盖真实
+Transformers `past_key_values`、完整 prompt 校验、无后缀续推、校验和破坏检测、TTL、LRU
+配额以及 API 鉴权。
+
+服务启动后，可对任意 UTF-8 长文本比较冷 prefill 与缓存复用耗时：
+
+```bash
+python scripts/benchmark.py ./long-document.txt --runs 3 --max-tokens 64
 ```

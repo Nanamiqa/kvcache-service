@@ -18,6 +18,11 @@ class CacheCompatibilityError(KVCacheError):
     code = "cache_incompatible"
 
 
+class CacheExpiredError(KVCacheError):
+    status_code = 410
+    code = "cache_expired"
+
+
 class ContextLengthError(KVCacheError):
     status_code = 422
     code = "context_length_exceeded"

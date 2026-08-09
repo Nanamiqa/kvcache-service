@@ -45,9 +45,13 @@ readiness 检查可在 backend 内按需缓存。
 
 - `BuildCacheCommand.text` 与 `input_ids` 二选一。
 - `CompletionCommand.prompt` 是**已缓存前缀之后的后缀**，不是完整 prompt。
+- 当 `CompletionCommand.prompt_mode == "full"` 时，backend 应验证并剥离完整输入中的缓存
+  前缀；无法支持时应明确返回 `CacheCompatibilityError`。
 - 没有 `cache_id` 时，`complete` 应执行普通生成。
 - backend 应保证同一个 `cache_id` 对应不可变内容。
 - 不兼容返回 `CacheCompatibilityError`，不存在返回 `CacheNotFoundError`，上下文越界返回
   `ContextLengthError`；HTTP 层会生成稳定错误结构。
 - 如果云 API 只能自动缓存而不能显式创建，`build_cache` 可以保存逻辑前缀，首次
   `complete` 负责预热，后续请求返回实际命中统计。
+- `CompletionResult.timings_ms` 至少应包含 `cache_load`、`input_processing`、`prefill`、
+  `decode` 和 `total`，无法拆分的远端 API 可以把未知阶段设为 `0`。

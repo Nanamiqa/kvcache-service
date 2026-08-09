@@ -1,0 +1,22 @@
+services:
+  kvcache:
+    build:
+      context: .
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    ports:
+      - "8080:8080"
+    environment:
+      KVCACHE_MODEL: ${KVCACHE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+      KVCACHE_DEVICE: cpu
+      KVCACHE_DTYPE: float32
+      KVCACHE_CACHE_TTL_SECONDS: ${KVCACHE_CACHE_TTL_SECONDS:-86400}
+      KVCACHE_MAX_STORE_BYTES: ${KVCACHE_MAX_STORE_BYTES:-10737418240}
+      KVCACHE_API_KEY: ${KVCACHE_API_KEY:-}
+    volumes:
+      - ./data/kv-cache:/data/kv-cache
+      - huggingface-cache:/models/huggingface
+    restart: unless-stopped
+
+volumes:
+  huggingface-cache:

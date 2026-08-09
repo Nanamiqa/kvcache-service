@@ -36,6 +36,22 @@ class KVCacheBackend(ABC):
     def delete_cache(self, cache_id: str) -> bool:
         raise NotImplementedError
 
+    def cache_stats(self) -> Dict[str, int]:
+        """Return backend cache storage counters when supported."""
+
+        return {
+            "cache_count": 0,
+            "tensor_bytes": 0,
+            "disk_bytes": 0,
+            "max_store_bytes": 0,
+            "ttl_seconds": 0,
+        }
+
+    def prune_caches(self) -> Dict[str, int]:
+        """Remove expired/over-quota entries when supported."""
+
+        return {"removed_count": 0, "freed_bytes": 0}
+
     @abstractmethod
     def complete(self, command: CompletionCommand) -> CompletionResult:
         raise NotImplementedError

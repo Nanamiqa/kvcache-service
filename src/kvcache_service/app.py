@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import threading
 import time
 import uuid
@@ -10,10 +11,13 @@ from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from . import __version__
 from .api_models import (
     CacheCreateRequest,
     CacheInfoResponse,
     CacheListResponse,
+    CachePruneResponse,
+    CacheStoreStatsResponse,
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
@@ -34,7 +38,7 @@ def create_app(
     resolved_settings = settings or Settings.from_env()
     application = FastAPI(
         title="KV Cache Service",
-        version="0.1.0",
+        version=__version__,
         description=(
             "Persist long-prefix KV tensors and reuse them through an OpenAI-style completion API."
         ),
@@ -48,6 +52,26 @@ def create_app(
                 if application.state.backend is None:
                     application.state.backend = load_backend(resolved_settings)
         return application.state.backend
+
+    @application.middleware("http")
+    async def api_key_authentication(request: Request, call_next):
+        if resolved_settings.api_key and request.url.path.startswith("/v1/"):
+            authorization = request.headers.get("authorization", "")
+            bearer = authorization[7:] if authorization.lower().startswith("bearer ") else ""
+            supplied = bearer or request.headers.get("x-api-key", "")
+            if not supplied or not secrets.compare_digest(supplied, resolved_settings.api_key):
+                return JSONResponse(
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                    content={
+                        "error": {
+                            "code": "invalid_api_key",
+                            "message": "A valid API key is required",
+                            "type": "authentication_error",
+                        }
+                    },
+                )
+        return await call_next(request)
 
     @application.exception_handler(KVCacheError)
     async def kv_cache_error_handler(_: Request, exc: KVCacheError) -> JSONResponse:
@@ -88,6 +112,19 @@ def create_app(
             data=[CacheInfoResponse(**item.to_dict()) for item in current_backend().list_caches()]
         )
 
+    @application.get("/v1/kv-caches/stats", response_model=CacheStoreStatsResponse)
+    def cache_stats() -> CacheStoreStatsResponse:
+        return CacheStoreStatsResponse(**current_backend().cache_stats())
+
+    @application.post("/v1/kv-caches/prune", response_model=CachePruneResponse)
+    def prune_caches() -> CachePruneResponse:
+        selected_backend = current_backend()
+        result = selected_backend.prune_caches()
+        return CachePruneResponse(
+            **result,
+            stats=CacheStoreStatsResponse(**selected_backend.cache_stats()),
+        )
+
     @application.get("/v1/kv-caches/{cache_id}", response_model=CacheInfoResponse)
     def get_cache(cache_id: str) -> CacheInfoResponse:
         return CacheInfoResponse(**current_backend().get_cache(cache_id).to_dict())
@@ -119,6 +156,7 @@ def create_app(
                 seed=request.seed,
                 stop=request.normalized_stop(),
                 stop_token_ids=request.stop_token_ids,
+                prompt_mode=request.prompt_mode,
             )
         )
         completion_tokens = len(result.token_ids)
@@ -140,6 +178,7 @@ def create_app(
                 cached_tokens=result.cached_tokens,
             ),
             kv_cache_id=request.kv_cache_id,
+            timings_ms=result.timings_ms,
         )
 
     return application

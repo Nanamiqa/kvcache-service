@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kvcache-service"
-version = "0.1.0"
+version = "0.2.0"
 description = "Persistent KV cache service for local and private LLM inference"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "KV Cache Service Contributors" }]
 dependencies = [
   "fastapi>=0.110,<1",
+  "filelock>=3.12,<4",
   "pydantic>=2.6,<3",
   "safetensors>=0.4,<1",
   "uvicorn[standard]>=0.27,<1",
@@ -24,12 +25,18 @@ local = [
   "accelerate>=1.0,<2",
 ]
 test = [
+  "build>=1.2,<2",
   "httpx>=0.27,<1",
   "pytest>=8,<10",
 ]
 dev = [
-  "kvcache-service[local,test]",
+  "accelerate>=1.0,<2",
+  "build>=1.2,<2",
+  "httpx>=0.27,<1",
+  "pytest>=8,<10",
   "ruff>=0.9,<1",
+  "torch>=2.2,<3",
+  "transformers>=4.56,<4.58",
 ]
 
 [project.scripts]

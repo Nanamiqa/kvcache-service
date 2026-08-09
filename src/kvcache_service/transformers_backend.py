@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .backend import KVCacheBackend
@@ -40,7 +42,10 @@ class TransformersBackend(KVCacheBackend):
     ) -> None:
         self.settings = settings
         self.store = store or SafeTensorCacheStore(
-            settings.store_dir, verify_checksum=settings.verify_checksum
+            settings.store_dir,
+            verify_checksum=settings.verify_checksum,
+            ttl_seconds=settings.cache_ttl_seconds,
+            max_store_bytes=settings.max_store_bytes,
         )
         self._model = model
         self._tokenizer = tokenizer
@@ -137,7 +142,6 @@ class TransformersBackend(KVCacheBackend):
     def _fingerprint(self) -> str:
         config = self._model.config
         config_data = config.to_dict() if hasattr(config, "to_dict") else vars(config)
-        commit = getattr(config, "_commit_hash", None) or self.settings.model_revision
         dtype = (
             str(next(iter(self._model.parameters())).dtype)
             if hasattr(self._model, "parameters")
@@ -149,7 +153,7 @@ class TransformersBackend(KVCacheBackend):
         }
         payload = {
             "model_id": self.settings.model_id,
-            "revision": commit,
+            "source": self._model_source_identity(),
             "dtype": dtype,
             "config": config_data,
             "tokenizer": tokenizer_data,
@@ -157,8 +161,40 @@ class TransformersBackend(KVCacheBackend):
         encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
-    def _validate_ids(self, token_ids: Sequence[int], label: str) -> List[int]:
-        if not token_ids:
+    def _model_source_identity(self) -> Dict[str, Any]:
+        if self.settings.model_fingerprint:
+            return {"kind": "explicit", "value": self.settings.model_fingerprint}
+
+        config = self._model.config
+        tokenizer_commit = getattr(self._tokenizer, "init_kwargs", {}).get("_commit_hash")
+        commit = getattr(config, "_commit_hash", None) or tokenizer_commit
+        if commit:
+            return {"kind": "hub", "commit": commit}
+
+        model_path = Path(self.settings.model_id).expanduser()
+        if not model_path.is_dir():
+            return {"kind": "revision", "revision": self.settings.model_revision}
+
+        digest = hashlib.sha256()
+        weight_suffixes = {".bin", ".pt", ".pth", ".safetensors"}
+        content_suffixes = {".json", ".model", ".py", ".tiktoken", ".txt"}
+        for path in sorted(item for item in model_path.rglob("*") if item.is_file()):
+            relative = str(path.relative_to(model_path))
+            stat = path.stat()
+            digest.update(relative.encode("utf-8"))
+            digest.update(str(stat.st_size).encode("ascii"))
+            if path.suffix in content_suffixes and stat.st_size <= 16 * 1024 * 1024:
+                with path.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(block)
+            elif path.suffix in weight_suffixes:
+                digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        return {"kind": "local_manifest", "sha256": digest.hexdigest()}
+
+    def _validate_ids(
+        self, token_ids: Sequence[int], label: str, *, allow_empty: bool = False
+    ) -> List[int]:
+        if not token_ids and not allow_empty:
             raise KVCacheError(f"{label} must contain at least one token")
         normalized = [int(token_id) for token_id in token_ids]
         vocab_size = getattr(self._tokenizer, "vocab_size", None)
@@ -222,10 +258,15 @@ class TransformersBackend(KVCacheBackend):
             "model": self.settings.model_id,
             "model_loaded": self._model_fingerprint is not None,
             "store": str(self.store.root),
+            "cache_policy": {
+                "ttl_seconds": self.store.ttl_seconds,
+                "max_store_bytes": self.store.max_store_bytes,
+            },
         }
 
     def build_cache(self, command: BuildCacheCommand) -> CacheInfo:
         self._ensure_loaded()
+        self.store.prune()
         if command.input_ids is not None:
             token_ids = self._validate_ids(command.input_ids, "input_ids")
         elif command.text is not None:
@@ -271,6 +312,12 @@ class TransformersBackend(KVCacheBackend):
     def delete_cache(self, cache_id: str) -> bool:
         return self.store.delete(cache_id)
 
+    def cache_stats(self) -> Dict[str, int]:
+        return self.store.stats()
+
+    def prune_caches(self) -> Dict[str, int]:
+        return self.store.prune()
+
     def _eos_ids(self) -> List[int]:
         eos = getattr(self._model.config, "eos_token_id", None)
         if eos is None:
@@ -307,35 +354,88 @@ class TransformersBackend(KVCacheBackend):
             list(token_ids), skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
 
+    def _completion_input_ids(
+        self, command: CompletionCommand, cached_prefix_ids: Optional[List[int]]
+    ) -> List[int]:
+        has_explicit_input = command.input_ids is not None or command.prompt is not None
+        if command.input_ids is not None:
+            provided = self._validate_ids(
+                command.input_ids,
+                "input_ids",
+                allow_empty=cached_prefix_ids is not None and command.prompt_mode == "suffix",
+            )
+        elif command.prompt is not None:
+            add_special_tokens = cached_prefix_ids is None or command.prompt_mode == "full"
+            if command.prompt == "" and not add_special_tokens:
+                provided = []
+            else:
+                encoded = self._tokenizer.encode(
+                    command.prompt, add_special_tokens=add_special_tokens
+                )
+                provided = self._validate_ids(
+                    encoded,
+                    "Encoded text",
+                    allow_empty=cached_prefix_ids is not None and command.prompt_mode == "suffix",
+                )
+        else:
+            provided = []
+
+        if cached_prefix_ids is None or command.prompt_mode == "suffix":
+            return provided
+        if not has_explicit_input:
+            return []
+        prefix_length = len(cached_prefix_ids)
+        if len(provided) < prefix_length or provided[:prefix_length] != cached_prefix_ids:
+            mismatch = next(
+                (
+                    index
+                    for index, (expected, actual) in enumerate(zip(cached_prefix_ids, provided))
+                    if expected != actual
+                ),
+                min(len(provided), prefix_length),
+            )
+            raise CacheCompatibilityError(
+                "Full prompt does not start with the exact cached token prefix; "
+                f"first mismatch is at token index {mismatch}"
+            )
+        return provided[prefix_length:]
+
     def complete(self, command: CompletionCommand) -> CompletionResult:
+        total_started = time.perf_counter()
         self._ensure_loaded()
         if command.max_tokens > self.settings.max_new_tokens:
             raise KVCacheError(f"max_tokens exceeds service limit {self.settings.max_new_tokens}")
-
-        if command.input_ids is not None:
-            suffix_ids = self._validate_ids(command.input_ids, "input_ids")
-        elif command.prompt is not None:
-            # A reused prefix already owns BOS/special tokens; the suffix must not add them again.
-            if command.prompt == "" and command.cache_id is not None:
-                suffix_ids = []
-            else:
-                suffix_ids = self._encode(command.prompt, prefix=command.cache_id is None)
-        else:
-            suffix_ids = []
+        if command.prompt_mode not in {"suffix", "full"}:
+            raise KVCacheError("prompt_mode must be 'suffix' or 'full'")
 
         with self._inference_lock:
+            cache_load_ms = 0.0
+            input_processing_ms = 0.0
+            prefill_ms = 0.0
             if command.cache_id:
+                load_started = time.perf_counter()
                 info, tensors = self.store.load(command.cache_id)
                 if info.model_fingerprint != self._model_fingerprint:
                     raise CacheCompatibilityError(
                         "Cache was built by a different model revision, tokenizer, or dtype"
                     )
-                prompt_tokens = info.token_count + len(suffix_ids)
-                self._check_context(prompt_tokens + command.max_tokens)
+                stored_prefix = tensors.get("prefix.input_ids")
+                if stored_prefix is None or int(stored_prefix.numel()) != info.token_count:
+                    raise CacheCompatibilityError(
+                        "Stored prefix token ids are missing or inconsistent with metadata"
+                    )
+                cached_prefix_ids = [int(item) for item in stored_prefix.tolist()]
                 past = tensors_to_cache(tensors, self._device)
                 prefix_tokens = info.token_count
                 logits = tensors["prefix.next_logits"].to(self._device)
+                cache_load_ms = (time.perf_counter() - load_started) * 1000
+                input_started = time.perf_counter()
+                suffix_ids = self._completion_input_ids(command, cached_prefix_ids)
+                input_processing_ms = (time.perf_counter() - input_started) * 1000
+                prompt_tokens = info.token_count + len(suffix_ids)
+                self._check_context(prompt_tokens + command.max_tokens)
                 if suffix_ids:
+                    prefill_started = time.perf_counter()
                     past, logits = self._prefill(
                         suffix_ids,
                         self.settings.default_chunk_size,
@@ -343,14 +443,20 @@ class TransformersBackend(KVCacheBackend):
                         past_length=prefix_tokens,
                     )
                     logits = logits.squeeze(0)
+                    prefill_ms = (time.perf_counter() - prefill_started) * 1000
             else:
+                input_started = time.perf_counter()
+                suffix_ids = self._completion_input_ids(command, None)
+                input_processing_ms = (time.perf_counter() - input_started) * 1000
                 if not suffix_ids:
                     raise KVCacheError("prompt or input_ids is required when kv_cache_id is absent")
                 prefix_tokens = 0
                 prompt_tokens = len(suffix_ids)
                 self._check_context(prompt_tokens + command.max_tokens)
+                prefill_started = time.perf_counter()
                 past, logits = self._prefill(suffix_ids, self.settings.default_chunk_size)
                 logits = logits.squeeze(0)
+                prefill_ms = (time.perf_counter() - prefill_started) * 1000
 
             prompt_tokens = prefix_tokens + len(suffix_ids)
             generated: List[int] = []
@@ -363,6 +469,7 @@ class TransformersBackend(KVCacheBackend):
             else:
                 generator.seed()
 
+            decode_started = time.perf_counter()
             for index in range(command.max_tokens):
                 token_id = self._sample(logits, command, generator)
                 generated.append(token_id)
@@ -378,6 +485,7 @@ class TransformersBackend(KVCacheBackend):
                         [token_id], past, prompt_tokens + len(generated)
                     )
                     logits = next_logits.squeeze(0)
+            decode_ms = (time.perf_counter() - decode_started) * 1000
 
             text = self._decode(generated)
             for stop in command.stop:
@@ -391,4 +499,11 @@ class TransformersBackend(KVCacheBackend):
                 prompt_tokens=prompt_tokens,
                 cached_tokens=prefix_tokens,
                 finish_reason=finish_reason,
+                timings_ms={
+                    "cache_load": round(cache_load_ms, 3),
+                    "input_processing": round(input_processing_ms, 3),
+                    "prefill": round(prefill_ms, 3),
+                    "decode": round(decode_ms, 3),
+                    "total": round((time.perf_counter() - total_started) * 1000, 3),
+                },
             )

@@ -19,6 +19,7 @@ class CacheInfo:
     tensor_bytes: int
     created_at: str
     chunk_size: int
+    expires_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -43,6 +44,7 @@ class CompletionCommand:
     seed: Optional[int]
     stop: List[str]
     stop_token_ids: List[int]
+    prompt_mode: str = "suffix"
 
 
 @dataclass(frozen=True)
@@ -53,3 +55,4 @@ class CompletionResult:
     prompt_tokens: int
     cached_tokens: int
     finish_reason: str
+    timings_ms: Dict[str, float]

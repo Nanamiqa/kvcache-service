@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from .errors import BackendConfigurationError
 
@@ -34,6 +35,13 @@ def _int_env(name: str, default: int, minimum: int = 0) -> int:
     return value
 
 
+def _optional_env(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
 @dataclass(frozen=True)
 class Settings:
     backend: str = "transformers"
@@ -41,13 +49,17 @@ class Settings:
     model_revision: str = "main"
     device: str = "auto"
     dtype: str = "auto"
+    model_fingerprint: Optional[str] = None
     trust_remote_code: bool = False
     local_files_only: bool = False
     store_dir: Path = Path("data/kv-cache")
     verify_checksum: bool = True
+    cache_ttl_seconds: int = 0
+    max_store_bytes: int = 0
     max_context_tokens: int = 0
     default_chunk_size: int = 512
     max_new_tokens: int = 2048
+    api_key: Optional[str] = field(default=None, repr=False)
     host: str = "0.0.0.0"
     port: int = 8080
     log_level: str = "info"
@@ -60,13 +72,17 @@ class Settings:
             model_revision=os.getenv("KVCACHE_MODEL_REVISION", "main"),
             device=os.getenv("KVCACHE_DEVICE", "auto"),
             dtype=os.getenv("KVCACHE_DTYPE", "auto"),
+            model_fingerprint=_optional_env("KVCACHE_MODEL_FINGERPRINT"),
             trust_remote_code=_bool_env("KVCACHE_TRUST_REMOTE_CODE", False),
             local_files_only=_bool_env("KVCACHE_LOCAL_FILES_ONLY", False),
             store_dir=Path(os.getenv("KVCACHE_STORE_DIR", "data/kv-cache")).expanduser(),
             verify_checksum=_bool_env("KVCACHE_VERIFY_CHECKSUM", True),
+            cache_ttl_seconds=_int_env("KVCACHE_CACHE_TTL_SECONDS", 0),
+            max_store_bytes=_int_env("KVCACHE_MAX_STORE_BYTES", 0),
             max_context_tokens=_int_env("KVCACHE_MAX_CONTEXT_TOKENS", 0),
             default_chunk_size=_int_env("KVCACHE_DEFAULT_CHUNK_SIZE", 512, 1),
             max_new_tokens=_int_env("KVCACHE_MAX_NEW_TOKENS", 2048, 1),
+            api_key=_optional_env("KVCACHE_API_KEY"),
             host=os.getenv("KVCACHE_HOST", "0.0.0.0"),
             port=_int_env("KVCACHE_PORT", 8080, 1),
             log_level=os.getenv("KVCACHE_LOG_LEVEL", "info"),
