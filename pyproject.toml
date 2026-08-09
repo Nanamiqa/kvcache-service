@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kvcache-service"
+version = "0.1.0"
+description = "Persistent KV cache service for local and private LLM inference"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "KV Cache Service Contributors" }]
+dependencies = [
+  "fastapi>=0.110,<1",
+  "pydantic>=2.6,<3",
+  "safetensors>=0.4,<1",
+  "uvicorn[standard]>=0.27,<1",
+]
+
+[project.optional-dependencies]
+local = [
+  "torch>=2.2,<3",
+  "transformers>=4.56,<4.58",
+  "accelerate>=1.0,<2",
+]
+test = [
+  "httpx>=0.27,<1",
+  "pytest>=8,<10",
+]
+dev = [
+  "kvcache-service[local,test]",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+kvcache-server = "kvcache_service.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kvcache_service"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# Optional/Union remains runtime-safe on Python 3.9 when Pydantic resolves annotations.
+ignore = ["UP006", "UP007", "UP035", "UP045"]

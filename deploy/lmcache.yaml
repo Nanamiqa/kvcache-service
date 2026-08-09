@@ -1,0 +1,6 @@
+# Reference LMCache V1 configuration for a single private inference node.
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 20.0
+local_disk: "file:///var/lib/lmcache"
+max_local_disk_size: 200.0
