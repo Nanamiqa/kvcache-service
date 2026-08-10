@@ -1,84 +1,210 @@
 # KV Cache Service
 
-一套面向本地或私有化大模型的 KV Cache 持久化服务。它把超长公共前缀分块执行
-prefill，将每层 Key/Value 张量安全落盘，并在后续请求中跳过公共前缀计算，直接从缓存
-继续推理。
+<div align="center">
 
-当前版本是可运行的单机参考实现，同时保留了 backend 插件边界。生产环境中需要高并发、
-多 GPU、分层存储或自动前缀匹配时，建议使用仓库内给出的 vLLM + LMCache 方案。
+**面向本地与私有化大语言模型推理的持久化 KV Cache 服务**
 
-0.2 版补齐了服务化必需能力：跨进程存储锁、TTL/LRU 容量治理、可选 API Key、完整
-prompt 的精确 token 前缀验证、分阶段耗时，以及 Docker、CI 和基准脚本。
+[![CI](https://github.com/Nanamiqa/kvcache-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Nanamiqa/kvcache-service/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
+![Version](https://img.shields.io/badge/version-0.2.0-blue)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## 先说结论
+</div>
 
-这个目标可以实现，但有几个不能绕过的边界：
+KV Cache Service 为重复长前缀推理提供一套可运行、可扩展的单机参考实现。服务将公共前缀
+分块执行预填充（prefill），把模型每层的 Key/Value 张量安全持久化，并在后续请求中恢复
+缓存、跳过已处理前缀，仅计算新增内容后继续解码。
 
-- 原始 KV 只能在**完全相同的模型权重、revision、tokenizer、dtype 和兼容 cache layout**
-  上复用。它不是跨模型通用的“文本向量”。
-- 分块 prefill 可以降低单次 prefill 的峰值计算压力，却不能突破模型的位置编码/context
-  window。文本超过模型上限时，应换长上下文模型，或先做 RAG/分段摘要。
-- 多数公有云 API 不提供原始 KV 张量的上传/下载能力。它们的 prompt caching 通常由服务商
-  自动管理，只能复用相同前缀，不能把本项目生成的 KV 注入云端。
-- KV 很大。理论大小约为
-  `2 × 层数 × KV heads × head_dim × token 数 × 每元素字节数 × batch`。
-  例如一个 28 层、4 个 KV heads、head_dim=128 的 GQA 模型，在 FP16 下约为
-  56 KiB/token，128K tokens 约 7 GiB（未计元数据和运行时开销）。
+项目通过 FastAPI 提供缓存生命周期管理及 OpenAI 风格的 Completion API，并以
+`KVCacheBackend` 抽象隔离 HTTP 协议与具体推理引擎，适用于功能验证、性能评估、私有化
+原型及自定义缓存后端开发。
 
-因此推荐的分层选择是：
+> [!IMPORTANT]
+> 当前内置的 Transformers backend 定位为单机参考实现，不面向多 GPU 或高并发生产负载。
+> 生产环境如需自动前缀匹配、GPU/CPU/NVMe 分层缓存及多实例共享，建议采用
+> [vLLM + LMCache](deploy/README.md) 方案。
 
-| 场景 | 推荐实现 | 适用性 |
+## 目录
+
+- [项目定位](#项目定位)
+- [核心能力](#核心能力)
+- [适用场景与方案选择](#适用场景与方案选择)
+- [工作原理](#工作原理)
+- [系统要求](#系统要求)
+- [快速开始](#快速开始)
+- [使用方式](#使用方式)
+- [API 概览](#api-概览)
+- [持久化与一致性](#持久化与一致性)
+- [容量评估](#容量评估)
+- [配置](#配置)
+- [兼容性约束](#兼容性约束)
+- [安全建议](#安全建议)
+- [扩展 Backend](#扩展-backend)
+- [生产部署](#生产部署)
+- [测试与性能评估](#测试与性能评估)
+- [项目结构](#项目结构)
+- [许可证](#许可证)
+
+## 项目定位
+
+自回归大语言模型在处理输入时，会为每个 token、每个注意力层生成 Key/Value 状态。对于
+包含相同长前缀的多个请求，常规推理流程会重复计算该前缀，造成额外算力消耗并增加首 token
+延迟（Time to First Token，TTFT）。
+
+KV Cache Service 将这部分计算结果转换为可复用的缓存制品：
+
+```text
+首次请求：公共长前缀 ──prefill──> KV Cache ──持久化──> CPU / NVMe
+后续请求：读取 KV Cache + 新增后缀 ──prefill──> decode ──> 生成结果
+```
+
+本项目缓存的是模型内部张量，而不是答案、文本向量或检索索引。因此，它不会替代 Redis、
+向量数据库或 RAG 系统，也不能突破模型本身的上下文窗口。
+
+## 核心能力
+
+- **分块预填充**：按指定 token 数分块执行长前缀 prefill，避免一次性提交全部输入。
+- **显式缓存复用**：通过稳定的 `cache_id` 创建、查询、加载和删除 KV Cache。
+- **内容寻址**：`cache_id` 由模型指纹与精确 token 序列共同确定；相同输入不会重复构建。
+- **安全持久化**：使用 `safetensors` 保存张量，避免反序列化任意 Python 对象。
+- **一致性保护**：缓存发布采用临时目录和原子替换，并默认校验张量文件 SHA-256。
+- **精确前缀验证**：`prompt_mode=full` 时逐 token 验证完整输入是否以缓存前缀开头。
+- **容量治理**：支持 TTL、存储容量上限、LRU 淘汰和主动清理。
+- **跨进程协调**：进程内锁与文件锁共同保护缓存的读、写、删操作。
+- **访问控制**：可为全部 `/v1/*` 路由启用 Bearer Token 或 `X-API-Key` 鉴权。
+- **阶段耗时统计**：返回缓存加载、输入处理、prefill、decode 和端到端耗时。
+- **可插拔 Backend**：可接入本地推理引擎、私有服务或云厂商逻辑缓存接口。
+- **工程化支持**：提供 Docker、Docker Compose、GitHub Actions、测试与基准脚本。
+
+## 适用场景与方案选择
+
+典型适用场景包括：
+
+- 对同一份长文档、代码上下文、合同或知识材料反复提问；
+- 多个请求共享固定的系统提示词、工具定义或 few-shot 示例；
+- 私有化 Agent 工作流中存在复用率较高的稳定前缀；
+- 研究磁盘加载 KV Cache 与重新 prefill 之间的性能边界；
+- 验证显式缓存 ID、缓存生命周期及模型兼容性语义；
+- 为自研推理引擎或云端 Prompt Cache 构建统一 HTTP 控制面。
+
+建议根据实际负载选择实现路径：
+
+| 场景 | 推荐方案 | 说明 |
 |---|---|---|
-| 功能验证、单机低并发、需要显式 cache ID | 本仓库 Transformers backend | 已实现 |
-| 私有化生产、多 GPU、高并发、磁盘/CPU 分层 | vLLM + LMCache | 见 `deploy/` |
-| 公有云模型 API | 实现自定义 backend，映射服务商的 prompt-cache 语义 | 已预留接口 |
+| 功能验证、单机低并发、显式缓存 ID | 本仓库 Transformers backend | 已实现 |
+| 私有化生产、多 GPU、高并发、分层存储 | vLLM + LMCache | 参见 [`deploy/`](deploy/README.md) |
+| 已有私有推理平台 | 自定义 `KVCacheBackend` | 复用本项目 HTTP 契约 |
+| 公有云模型 API | 逻辑缓存 backend | 映射厂商 Prompt Cache 语义 |
+| 短输入或低前缀复用率 | 普通推理 | 缓存加载成本可能高于重算 |
 
-## 架构
+## 工作原理
+
+### 系统架构
 
 ```mermaid
 flowchart LR
-    C["Client / SDK"] --> A["FastAPI contract"]
+    C["Client / SDK"] --> A["FastAPI API"]
     A --> B["KVCacheBackend"]
     B --> T["Transformers backend"]
-    B -. "future adapter" .-> V["vLLM / SGLang"]
-    B -. "future adapter" .-> P["Cloud provider API"]
-    T --> M["Local/private model"]
+    B -. "custom adapter" .-> V["Private inference engine"]
+    B -. "logical cache adapter" .-> P["Cloud provider API"]
+    T --> M["Local / private model"]
     T --> S["Atomic safetensors store"]
-    S --> D["CPU / NVMe disk"]
+    S --> D["CPU memory / NVMe disk"]
 ```
 
-`KVCacheBackend` 是稳定扩展点。HTTP 层不依赖 Transformers；后续可以换成远端私有推理
-服务、对象存储、LMCache 控制面或某个云厂商的逻辑缓存句柄。
+HTTP 层仅依赖 `KVCacheBackend` 抽象，不直接依赖 Transformers。替换 backend 时，缓存管理
+和 Completion API 无需改动。
+
+### 缓存构建流程
+
+1. 接收公共前缀文本或调用方提供的 `input_ids`。
+2. 使用目标模型的 tokenizer 得到精确 token 序列。
+3. 校验 token 数未超过模型上下文窗口。
+4. 按 `chunk_size` 分块执行 prefill，并持续累积 `past_key_values`。
+5. 计算模型指纹、前缀哈希和内容寻址 `cache_id`。
+6. 将每层 Key/Value、前缀 token IDs 及下一 token logits 写入 `safetensors`。
+7. 生成元数据和校验和，以原子方式发布缓存目录。
+
+### 缓存复用流程
+
+1. 根据 `cache_id` 读取元数据与张量文件。
+2. 校验缓存未过期、文件未损坏且模型指纹一致。
+3. 将缓存张量恢复到推理设备。
+4. 可选地验证完整 prompt 与已缓存 token 前缀完全一致。
+5. 仅对新增后缀执行 prefill，随后进入正常 token 解码流程。
+
+## 系统要求
+
+| 项目 | 要求 |
+|---|---|
+| Python | 3.9 及以上；推荐 3.11 或 3.12 |
+| 操作系统 | Linux、macOS 或 Windows |
+| 推理框架 | PyTorch 2.2–2.x、Transformers 4.56–4.57 |
+| 模型类型 | Decoder-only Causal Language Model |
+| 设备 | CPU、CUDA 或 MPS；由 `KVCACHE_DEVICE` 控制 |
+| 存储 | 本地文件系统；建议使用容量充足的高速 NVMe |
+
+默认示例模型为 `Qwen/Qwen2.5-0.5B-Instruct`。首次实际构建缓存时，Transformers 会从
+Hugging Face 下载模型。离线环境可将 `KVCACHE_MODEL` 指向本地模型目录，并设置
+`KVCACHE_LOCAL_FILES_ONLY=true`。
 
 ## 快速开始
 
-建议使用 Python 3.11 或 3.12。Transformers 参考 backend 的安装方式：
+### 方式一：本地安装
+
+克隆仓库并创建虚拟环境：
 
 ```bash
+git clone https://github.com/Nanamiqa/kvcache-service.git
+cd kvcache-service
 python -m venv .venv
+```
+
+Linux 或 macOS：
+
+```bash
 source .venv/bin/activate
 pip install -e '.[local]'
 cp .env.example .env
-set -a
-source .env
-set +a
 kvcache-server
 ```
 
-默认模型是体积较小的 `Qwen/Qwen2.5-0.5B-Instruct`。首次启动实际构建缓存时会从
-Hugging Face 下载模型；私有环境可把 `KVCACHE_MODEL` 指向本地模型目录，并设置
-`KVCACHE_LOCAL_FILES_ONLY=true`。
+Windows PowerShell：
 
-也可以启动 CPU 演示容器：
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[local]"
+Copy-Item .env.example .env
+kvcache-server
+```
+
+服务默认监听 `http://localhost:8080`。默认配置可直接启动；`.env.example` 用于展示配置项，
+如需覆盖默认值，请在启动进程前把相应变量导入当前环境。
+
+### 方式二：Docker Compose
 
 ```bash
 docker compose up --build
 ```
 
-GPU 生产镜像应改用与宿主 CUDA 匹配的 PyTorch/vLLM 基础镜像，不要直接使用这个 CPU
-演示镜像。
+该 Compose 配置用于 CPU 功能演示。GPU 部署应使用与宿主 CUDA 版本匹配的 PyTorch、vLLM
+或厂商基础镜像，不应直接把演示镜像用于生产环境。
 
-### 1. 分块解析并存储公共前缀
+### 验证服务
+
+```bash
+curl http://localhost:8080/health
+```
+
+启动后还可访问以下地址：
+
+- OpenAPI 文档：`http://localhost:8080/docs`
+- OpenAPI Schema：`http://localhost:8080/openapi.json`
+
+## 使用方式
+
+### 1. 创建公共前缀缓存
 
 ```bash
 curl -X POST http://localhost:8080/v1/kv-caches \
@@ -89,63 +215,108 @@ curl -X POST http://localhost:8080/v1/kv-caches \
   }'
 ```
 
-响应中的 `cache_id` 由模型指纹和 token 序列共同决定。相同输入再次构建会直接命中现有
-缓存，不会重复 prefill。
+响应中的 `cache_id` 由模型指纹和精确 token 序列共同决定。同一模型环境下重复提交相同
+输入会返回已有缓存，不会再次执行 prefill。
 
-### 2. 直接复用已处理的 KV Cache
+### 2. 从缓存继续生成
 
 ```bash
 curl -X POST http://localhost:8080/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "kv_cache_id": "<上一步的 cache_id>",
+    "kv_cache_id": "<cache_id>",
     "prompt": "请概括上面的内容。",
     "max_tokens": 128,
     "temperature": 0
   }'
 ```
 
-`usage.cached_tokens` 是跳过 prefill 的前缀 token 数。也可不传 `kv_cache_id`，此时接口
-退化成普通 completion。
+响应中的关键字段：
 
-响应中的 `timings_ms` 分别给出 `cache_load`、`input_processing`、`prefill`、`decode` 和
-端到端 `total`，可直接用于判断磁盘加载是否抵消了 prefill 收益。
+- `usage.cached_tokens`：本次跳过 prefill 的前缀 token 数；
+- `usage.prompt_tokens`：缓存前缀与新增后缀的总 token 数；
+- `timings_ms.cache_load`：缓存读取与恢复耗时；
+- `timings_ms.prefill`：新增后缀 prefill 耗时；
+- `timings_ms.decode`：逐 token 解码耗时；
+- `timings_ms.total`：端到端总耗时。
 
-对 token 边界有严格要求时，构建和调用都传 `input_ids`。分别 tokenizer.encode
-`prefix` 与 `suffix` 可能和一次性编码 `prefix + suffix` 不完全相同，尤其是前缀没有以空格、
-换行或模板边界结尾时。
+不传 `kv_cache_id` 时，`/v1/completions` 会执行普通 Completion。
 
-如果调用方手里是完整 prompt 而不是后缀，可使用 `prompt_mode=full`。服务端会重新分词、
-逐 token 验证缓存前缀，再只计算新增部分；不匹配会返回 `409 cache_incompatible`：
+### 3. 使用完整 Prompt
+
+默认 `prompt_mode=suffix`，即 `prompt` 仅包含缓存前缀之后的新增内容。如果调用方持有完整
+prompt，可指定 `prompt_mode=full`：
+
+```bash
+curl -X POST http://localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "kv_cache_id": "<cache_id>",
+    "prompt": "<原始完整前缀>请概括上面的内容。",
+    "prompt_mode": "full",
+    "max_tokens": 128
+  }'
+```
+
+服务会重新分词并逐 token 校验缓存前缀，只计算剩余后缀。前缀不一致时返回
+`409 cache_incompatible`，不会在不兼容的 KV Cache 上继续推理。
+
+> [!NOTE]
+> 对 token 边界有严格要求时，建议在构建和调用阶段都传入 `input_ids`。分别编码
+> `prefix` 与 `suffix` 的结果不一定等同于一次性编码 `prefix + suffix`，尤其是在前缀末尾
+> 没有空格、换行或模板边界时。
+
+### 4. 启用 API Key
+
+设置环境变量：
+
+```bash
+export KVCACHE_API_KEY='replace-with-a-strong-secret'
+```
+
+之后访问 `/v1/*` 时需携带以下任一请求头：
+
+```http
+Authorization: Bearer replace-with-a-strong-secret
+```
+
+或：
+
+```http
+X-API-Key: replace-with-a-strong-secret
+```
+
+`/health` 保持公开，以便容器编排和负载均衡器执行存活探测。
+
+## API 概览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/health` | 返回服务、backend、模型及缓存策略状态 |
+| `GET` | `/v1/models` | 返回 OpenAI 风格模型列表 |
+| `POST` | `/v1/kv-caches` | 分块执行 prefill 并持久化公共前缀 |
+| `GET` | `/v1/kv-caches` | 列出有效缓存 |
+| `GET` | `/v1/kv-caches/stats` | 返回缓存数量、逻辑大小、磁盘占用及治理配置 |
+| `POST` | `/v1/kv-caches/prune` | 清理过期或超出容量限制的缓存 |
+| `GET` | `/v1/kv-caches/{id}` | 查询指定缓存元数据 |
+| `DELETE` | `/v1/kv-caches/{id}` | 删除指定缓存 |
+| `POST` | `/v1/completions` | 执行普通生成或从指定缓存继续生成 |
+
+API 使用 Pydantic 严格校验请求字段。服务错误采用稳定结构返回：
 
 ```json
 {
-  "kv_cache_id": "<cache_id>",
-  "prompt": "<原始完整前缀>请概括上面的内容。",
-  "prompt_mode": "full",
-  "max_tokens": 128
+  "error": {
+    "code": "cache_incompatible",
+    "message": "Full prompt does not start with the exact cached token prefix",
+    "type": "invalid_request_error"
+  }
 }
 ```
 
-## API
+## 持久化与一致性
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| `GET` | `/health` | 存活状态；不会主动加载模型权重 |
-| `GET` | `/v1/models` | OpenAI 风格模型列表 |
-| `POST` | `/v1/kv-caches` | 分块 prefill 并持久化 |
-| `GET` | `/v1/kv-caches` | 列出缓存 |
-| `GET` | `/v1/kv-caches/stats` | 缓存数量、逻辑/磁盘字节数和治理配置 |
-| `POST` | `/v1/kv-caches/prune` | 立即清理过期或超出容量的 LRU 缓存 |
-| `GET` | `/v1/kv-caches/{id}` | 读取元数据 |
-| `DELETE` | `/v1/kv-caches/{id}` | 删除缓存 |
-| `POST` | `/v1/completions` | 普通生成或从缓存继续生成 |
-
-服务启动后可访问 `http://localhost:8080/docs` 查看交互式 OpenAPI 文档。
-
-## 持久化格式与一致性
-
-每个缓存目录包含：
+默认情况下，每个缓存对应一个独立目录：
 
 ```text
 data/kv-cache/<cache_id>/
@@ -153,90 +324,232 @@ data/kv-cache/<cache_id>/
 └── tensors.safetensors
 ```
 
-- `safetensors` 避免反序列化任意 Python 对象。
-- 临时目录写完后原子发布，避免请求读到半成品。
-- 加载时默认校验 tensor 文件 SHA-256；同一进程内会记住已验证文件的 size/mtime，文件未变
-  时不重复扫描数 GiB 的缓存，文件发生变化后会自动重新校验。
-- metadata 保存模型指纹、前缀 token hash、层数、dtype 和体积。
-- tensor 文件包含每层 K/V、精确 prefix token IDs，以及“前缀结束后下一 token”的 logits，
-  因而即使 suffix 为空也能继续生成。
-- 进程内锁与文件锁共同保护读、写、删，允许同一缓存目录被多个 worker 安全使用。
-- 实际加载会刷新目录访问时间；容量超过 `KVCACHE_MAX_STORE_BYTES` 时按 LRU 淘汰，TTL
-  到期缓存由读请求或 prune 清理。单个新缓存大于总配额时会保留该缓存并在 stats 中反映
-  超额，避免刚构建成功就返回一个失效 ID。
+`metadata.json` 记录以下信息：
 
-KV 和 token IDs 都应按原始提示词同等级别保护。目录不应放在公开对象存储中，也不应跨
-租户共享；生产环境应补充磁盘加密、租户 namespace、访问控制和 TTL/LRU 淘汰。
+- 缓存 Schema 版本；
+- backend、模型 ID 与模型指纹；
+- 前缀 token 数量及 SHA-256；
+- K/V 层数、dtype 与逻辑字节数；
+- 创建时间、过期时间和构建分块大小；
+- `tensors.safetensors` 文件校验和。
 
-设置 `KVCACHE_API_KEY` 后，所有 `/v1/*` 路由都要求
-`Authorization: Bearer <key>` 或 `X-API-Key: <key>`；`/health` 保持公开，便于编排系统探活。
+`tensors.safetensors` 包含每层 K/V 张量、精确前缀 token IDs 以及前缀结束位置的下一 token
+logits。因此，即使后缀为空，服务仍可从缓存状态继续生成。
+
+存储层提供以下一致性保证：
+
+- 在临时目录完整写入后，以原子方式发布缓存；
+- 默认在首次加载或文件发生变化后校验 SHA-256；
+- 同一进程内缓存已验证文件的大小与修改时间，避免重复扫描大型张量文件；
+- 使用进程内可重入锁和跨进程文件锁保护读、写、删；
+- 实际加载缓存时刷新目录访问时间，供 LRU 淘汰使用；
+- 读取到过期缓存时自动删除；也可通过 prune API 主动清理；
+- 新缓存大于总配额时保留该缓存并在统计中反映超额，避免返回立即失效的缓存 ID。
+
+## 容量评估
+
+KV Cache 的理论大小可按以下公式估算：
+
+```text
+2 × 层数 × KV heads × head dimension × token 数 × 每元素字节数 × batch size
+```
+
+其中系数 `2` 分别代表 Key 与 Value。以 28 层、4 个 KV heads、head dimension 为 128、
+FP16、batch size 为 1 的 GQA 模型为例，理论占用约为 56 KiB/token；128K tokens 约需
+7 GiB，尚未包含元数据、文件系统和运行时搬运开销。
+
+实际部署前应同时评估：
+
+- 公共前缀长度、数量与平均复用次数；
+- KV dtype、模型层数及注意力结构；
+- 磁盘容量、顺序读带宽与并发读取能力；
+- CPU 内存以及 CPU→GPU 的有效带宽；
+- TTL、LRU 淘汰和租户隔离带来的冗余；
+- 缓存加载延迟是否低于重新 prefill 的计算延迟。
 
 ## 配置
 
-主要环境变量见 [`.env.example`](.env.example)：
+完整示例参见 [`.env.example`](.env.example)。
 
-- `KVCACHE_MODEL`：Hugging Face 模型 ID 或本地目录。
-- `KVCACHE_DEVICE`：`auto`、`cpu`、`cuda`、`mps` 等。
-- `KVCACHE_DTYPE`：`auto`、`float16`、`bfloat16`、`float32` 等。
-- `KVCACHE_MODEL_FINGERPRINT`：部署方提供的不可变权重标识；本地可变权重强烈建议设置。
-- `KVCACHE_STORE_DIR`：缓存根目录。
-- `KVCACHE_CACHE_TTL_SECONDS`：缓存有效期；`0` 表示不自动过期。
-- `KVCACHE_MAX_STORE_BYTES`：缓存目录容量上限；`0` 表示不限制。
-- `KVCACHE_MAX_CONTEXT_TOKENS`：显式覆盖模型 context window；`0` 表示从 config 读取。
-- `KVCACHE_BACKEND`：`transformers` 或 `python.module:factory`。
-- `KVCACHE_API_KEY`：可选 API 鉴权密钥。
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `KVCACHE_BACKEND` | `transformers` | 内置 backend 或 `python.module:factory` |
+| `KVCACHE_MODEL` | `Qwen/Qwen2.5-0.5B-Instruct` | Hugging Face 模型 ID 或本地目录 |
+| `KVCACHE_MODEL_REVISION` | `main` | 模型 revision |
+| `KVCACHE_DEVICE` | `auto` | `auto`、`cpu`、`cuda`、`mps` 等 |
+| `KVCACHE_DTYPE` | `auto` | `float16`、`bfloat16`、`float32` 等 |
+| `KVCACHE_MODEL_FINGERPRINT` | 空 | 部署方提供的不可变权重标识 |
+| `KVCACHE_TRUST_REMOTE_CODE` | `false` | 是否允许执行模型仓库 remote code |
+| `KVCACHE_LOCAL_FILES_ONLY` | `false` | 是否仅从本地读取模型文件 |
+| `KVCACHE_STORE_DIR` | `./data/kv-cache` | 缓存根目录 |
+| `KVCACHE_VERIFY_CHECKSUM` | `true` | 加载缓存时是否校验张量文件 |
+| `KVCACHE_CACHE_TTL_SECONDS` | `0` | 缓存有效期；`0` 表示不自动过期 |
+| `KVCACHE_MAX_STORE_BYTES` | `0` | 缓存总容量上限；`0` 表示不限制 |
+| `KVCACHE_MAX_CONTEXT_TOKENS` | `0` | 显式上下文上限；`0` 表示从模型配置读取 |
+| `KVCACHE_DEFAULT_CHUNK_SIZE` | `512` | 默认 prefill 分块 token 数 |
+| `KVCACHE_MAX_NEW_TOKENS` | `2048` | 单次请求允许生成的最大 token 数 |
+| `KVCACHE_API_KEY` | 空 | `/v1/*` 路由的可选鉴权密钥 |
+| `KVCACHE_HOST` | `0.0.0.0` | HTTP 监听地址 |
+| `KVCACHE_PORT` | `8080` | HTTP 监听端口 |
+| `KVCACHE_LOG_LEVEL` | `info` | Uvicorn 日志级别 |
 
-Hub 模型优先使用已解析 commit 作为模型来源标识；本地目录会对配置、tokenizer/remote code
-内容以及权重文件清单做指纹。若权重会被原地覆盖，务必通过
-`KVCACHE_MODEL_FINGERPRINT` 传入发布版本或完整权重 hash，确保旧 KV 不会被误用。
+## 兼容性约束
 
-当前 Transformers backend 有意限制为 batch=1、decoder-only、完整 Dynamic/legacy K/V
-layout，并用进程内锁串行访问单个模型。滑动窗口、hybrid attention、Mamba/线性 attention、
-tensor parallel 和高并发应走 vLLM/LMCache，而不是扩张这个参考实现。
+原始 KV Cache 只有在以下条件保持兼容时才能安全复用：
 
-## 接入新的私有或云端 API
+- 模型权重及其不可变 revision；
+- tokenizer、词表和 chat template；
+- dtype、量化方式和计算布局；
+- 注意力类型、KV heads、head dimension 与 RoPE 参数；
+- tensor-parallel 拓扑和 cache layout；
+- 精确 token 序列及其位置。
 
-实现 `src/kvcache_service/backend.py` 中的 `KVCacheBackend`，并暴露一个接收 `Settings`、
-返回 backend 实例的工厂：
+Hub 模型优先使用已解析 commit 标识模型来源；本地模型目录会根据配置、tokenizer、remote
+code 内容以及权重文件清单生成指纹。若本地权重可能被原地覆盖，应设置
+`KVCACHE_MODEL_FINGERPRINT` 为不可变发布版本或完整权重哈希，防止误用旧缓存。
+
+当前 Transformers backend 有意限制为：
+
+- batch size 为 1；
+- decoder-only Causal LM；
+- 完整的 Dynamic 或 legacy K/V layout；
+- 单个模型由进程内锁串行访问；
+- 不支持滑动窗口、hybrid attention、Mamba/线性 attention 和 tensor parallel。
+
+分块 prefill 不能突破模型的位置编码或上下文窗口。输入超过模型上限时，应使用长上下文
+模型，或在业务层采用 RAG、文本切分、摘要等策略。
+
+## 安全建议
+
+KV 张量和 token IDs 应按照原始提示词同等级别进行保护。虽然 KV Cache 不是明文文本，仍不
+应将其视为匿名或无敏感信息的数据。
+
+生产环境至少应落实以下措施：
+
+- 将缓存目录放置在受控的私有文件系统中，不使用公开对象存储；
+- 对缓存盘启用静态加密，并保护备份与快照；
+- 为不同租户使用独立 namespace、目录或存储实例；
+- 使用网关、网络策略和细粒度身份认证保护服务；
+- 配置合理的 TTL、容量上限、淘汰策略和安全删除机制；
+- 默认保持 `KVCACHE_TRUST_REMOTE_CODE=false`；
+- 定期轮换 API Key，并避免在日志或仓库中提交密钥；
+- 监控异常缓存加载、校验失败和跨租户访问行为。
+
+内置 API Key 适合开发和受控网络中的基础保护，不等同于完整的多租户认证与授权系统。
+
+## 扩展 Backend
+
+实现 [`KVCacheBackend`](src/kvcache_service/backend.py) 即可接入新的本地引擎、私有推理
+服务或公有云逻辑缓存。
+
+Backend 工厂应接收 `Settings` 并返回 `KVCacheBackend` 实例：
+
+```python
+def create_backend(settings: Settings) -> KVCacheBackend:
+    return MyBackend(settings)
+```
+
+通过环境变量加载：
 
 ```bash
-export KVCACHE_BACKEND=examples.custom_backend:create_backend
+export KVCACHE_BACKEND=my_package.provider:create_backend
 kvcache-server
 ```
 
-完整骨架见 [`examples/custom_backend.py`](examples/custom_backend.py) 和
-[`docs/backend-extension.md`](docs/backend-extension.md)。API 路由无需修改。
+仓库提供了可运行骨架和详细约定：
 
-## 生产化路径
+- [`examples/custom_backend.py`](examples/custom_backend.py)
+- [`docs/backend-extension.md`](docs/backend-extension.md)
 
-高并发部署不要让应用手动传递巨大的 K/V 文件。vLLM 的 Automatic Prefix Caching 可对
-重复 token block 自动命中；LMCache 则把这些 block 扩展到 GPU、CPU、NVMe 或远端分层
-存储，并通过 vLLM 的 OpenAI-compatible API 对外服务。配置和命令见
-[`deploy/README.md`](deploy/README.md)。
+对于能够访问模型内部张量的引擎，backend 可以直接保存和恢复原始 KV。对于不开放原始 KV
+的公有云 API，可将 `cache_id` 映射为厂商缓存名称、Prompt Cache Key 或公共前缀记录。
 
-相关官方资料：
+## 生产部署
 
-- [Transformers cache strategies](https://huggingface.co/docs/transformers/kv_cache)
-- [vLLM automatic prefix caching](https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/)
-- [LMCache architecture](https://docs.lmcache.ai/developer_guide/architecture.html)
-- [LMCache local storage](https://docs.lmcache.ai/kv_cache/storage_backends/local_storage.html)
+高并发生产环境不建议由应用层显式传输大型 K/V 文件。更合适的架构是：
 
-## 测试
+- 使用 vLLM 管理 GPU 内 KV block 和 Automatic Prefix Caching；
+- 使用 LMCache 将缓存扩展至 GPU、CPU、NVMe 或远端存储；
+- 由推理引擎根据相同 token block 自动匹配前缀；
+- 继续通过 OpenAI-compatible API 对外提供服务。
 
-测试使用伪 causal LM，不下载任何模型，但覆盖了真实 tensor 的分块 prefill、safetensors
-落盘、重载和缓存续推：
+参考配置与启动命令见 [`deploy/README.md`](deploy/README.md)。上线前应固定 vLLM、CUDA、
+PyTorch 与 LMCache 的兼容版本，不应在生产环境使用浮动的 `latest` 依赖。
+
+建议重点监控：
+
+- TTFT 与端到端延迟；
+- cache hit tokens 与命中率；
+- cache load/store latency；
+- GPU、CPU 与磁盘容量；
+- eviction、过期和校验失败次数；
+- CPU→GPU 与磁盘实际读取带宽。
+
+只有当“重新计算前缀的成本”高于“读取缓存并搬运至推理设备的成本”时，持久化 KV Cache
+才会产生实际收益。应使用真实模型、真实存储和真实请求分布进行基准测试。
+
+## 测试与性能评估
+
+安装开发依赖并执行完整检查：
 
 ```bash
 pip install -e '.[dev]'
+ruff check .
+ruff format --check .
 pytest
+python -m build
 ```
 
-仓库包含 GitHub Actions，会执行 Ruff、14 项单元/集成测试和 wheel 构建。测试覆盖真实
-Transformers `past_key_values`、完整 prompt 校验、无后缀续推、校验和破坏检测、TTL、LRU
-配额以及 API 鉴权。
+测试默认使用伪 Causal LM，不下载模型，覆盖以下行为：
 
-服务启动后，可对任意 UTF-8 长文本比较冷 prefill 与缓存复用耗时：
+- 分块 prefill、张量落盘、重新加载和缓存续推；
+- Transformers `past_key_values` 兼容性；
+- 完整 prompt 的精确 token 前缀验证；
+- 无后缀情况下从已保存 logits 继续生成；
+- SHA-256 校验和损坏检测；
+- TTL、LRU 配额和主动清理；
+- API Key 鉴权及稳定错误结构。
+
+GitHub Actions 会在推送和 Pull Request 时执行 Ruff、测试及 wheel 构建。
+
+服务启动后，可使用基准脚本比较冷 prefill 与缓存复用耗时：
 
 ```bash
 python scripts/benchmark.py ./long-document.txt --runs 3 --max-tokens 64
 ```
+
+建议重点比较输出中的 `cache_load`、`prefill` 和 `total`，并使用多种前缀长度与复用次数进行
+评估。
+
+## 项目结构
+
+```text
+kvcache-service/
+├── src/kvcache_service/
+│   ├── app.py                  # FastAPI 路由、鉴权与错误处理
+│   ├── backend.py              # Backend 抽象与动态加载
+│   ├── transformers_backend.py # Transformers 参考实现
+│   ├── store.py                # safetensors 持久化与容量治理
+│   ├── cache_codec.py          # K/V 张量编码与恢复
+│   ├── api_models.py           # API 请求与响应模型
+│   └── config.py               # 环境变量配置
+├── tests/                      # 单元及集成测试
+├── examples/                   # 自定义 Backend 示例
+├── docs/                       # 扩展文档
+├── deploy/                     # vLLM + LMCache 生产化参考
+├── scripts/benchmark.py        # 冷/热路径性能基准
+├── compose.yaml                # CPU 演示环境
+├── Dockerfile                  # 服务镜像
+└── pyproject.toml              # Python 包及工具配置
+```
+
+## 相关资料
+
+- [Transformers cache strategies](https://huggingface.co/docs/transformers/kv_cache)
+- [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/)
+- [LMCache architecture](https://docs.lmcache.ai/developer_guide/architecture.html)
+- [LMCache local storage](https://docs.lmcache.ai/kv_cache/storage_backends/local_storage.html)
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
