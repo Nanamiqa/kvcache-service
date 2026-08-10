@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from kvcache_service.backend import KVCacheBackend
 from kvcache_service.domain import (
@@ -106,21 +106,33 @@ class FakeBackend(KVCacheBackend):
             tensor_bytes=128,
             created_at=datetime.now(timezone.utc).isoformat(),
             chunk_size=command.chunk_size,
+            tenant_id=command.tenant_id,
         )
         self._items[cache_id] = info
         return info
 
-    def get_cache(self, cache_id: str) -> CacheInfo:
+    def get_cache(self, cache_id: str, tenant_id: str = "default") -> CacheInfo:
         try:
-            return self._items[cache_id]
+            info = self._items[cache_id]
         except KeyError as exc:
             raise CacheNotFoundError(cache_id) from exc
+        if info.tenant_id != tenant_id:
+            raise CacheNotFoundError(cache_id)
+        return info
 
-    def list_caches(self) -> List[CacheInfo]:
-        return list(self._items.values())
+    def list_caches(self, tenant_id: Optional[str] = None) -> List[CacheInfo]:
+        return [
+            info
+            for info in self._items.values()
+            if tenant_id is None or info.tenant_id == tenant_id
+        ]
 
-    def delete_cache(self, cache_id: str) -> bool:
-        return self._items.pop(cache_id, None) is not None
+    def delete_cache(self, cache_id: str, tenant_id: str = "default") -> bool:
+        info = self._items.get(cache_id)
+        if info is None or info.tenant_id != tenant_id:
+            return False
+        del self._items[cache_id]
+        return True
 
     def complete(self, command: CompletionCommand) -> CompletionResult:
         return CompletionResult(

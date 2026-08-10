@@ -6,23 +6,20 @@
 
 [![CI](https://github.com/Nanamiqa/kvcache-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Nanamiqa/kvcache-service/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 </div>
 
-KV Cache Service 为重复长前缀推理提供一套可运行、可扩展的单机参考实现。服务将公共前缀
-分块执行预填充（prefill），把模型每层的 Key/Value 张量安全持久化，并在后续请求中恢复
-缓存、跳过已处理前缀，仅计算新增内容后继续解码。
+KV Cache Service 是面向重复长前缀推理的缓存控制面与推理网关。0.3 版本提供两条运行路径：
 
-项目通过 FastAPI 提供缓存生命周期管理及 OpenAI 风格的 Completion API，并以
-`KVCacheBackend` 抽象隔离 HTTP 协议与具体推理引擎，适用于功能验证、性能评估、私有化
-原型及自定义缓存后端开发。
+- `transformers`：将每层 Key/Value 张量以 safetensors 持久化，适用于单机语义验证、研究和
+  自定义 backend 开发；
+- `vllm`：异步代理多个 vLLM 副本，以缓存亲和路由复用前缀，并可由 LMCache MP 扩展至
+  CPU/NVMe/远端分层，适用于多 GPU 和高并发部署。
 
-> [!IMPORTANT]
-> 当前内置的 Transformers backend 定位为单机参考实现，不面向多 GPU 或高并发生产负载。
-> 生产环境如需自动前缀匹配、GPU/CPU/NVMe 分层缓存及多实例共享，建议采用
-> [vLLM + LMCache](deploy/README.md) 方案。
+服务通过 FastAPI 提供缓存生命周期管理、OpenAI 风格 Completion API 和 SSE 流式输出，
+内置租户隔离、准入控制、超时/取消、熔断、Prometheus 指标、健康探针及优雅退出。
 
 ## 目录
 
@@ -74,7 +71,14 @@ KV Cache Service 将这部分计算结果转换为可复用的缓存制品：
 - **访问控制**：可为全部 `/v1/*` 路由启用 Bearer Token 或 `X-API-Key` 鉴权。
 - **阶段耗时统计**：返回缓存加载、输入处理、prefill、decode 和端到端耗时。
 - **可插拔 Backend**：可接入本地推理引擎、私有服务或云厂商逻辑缓存接口。
-- **工程化支持**：提供 Docker、Docker Compose、GitHub Actions、测试与基准脚本。
+- **异步流式推理**：完整代理 SSE，客户端断开时取消上游请求，并限制请求截止时间。
+- **多副本缓存亲和路由**：结合 rendezvous affinity、在途负载与 EWMA 延迟选择 vLLM。
+- **过载保护**：全局/租户并发上限、排队超时和每租户 token bucket 限流。
+- **故障隔离**：vLLM 重试、主动探测和逐副本熔断，避免故障副本拖垮入口。
+- **水平扩展控制面**：Redis 共享逻辑索引、TTL 和分布式预热锁；SQLite 供单网关使用。
+- **多租户安全**：租户 API key、租户参与 cache identity、管理员状态接口。
+- **可观察性**：Prometheus 请求、缓存、token、后端延迟/健康度指标及标准探针。
+- **工程化支持**：提供轻量网关镜像、生产 Compose、Kubernetes、测试与压测脚本。
 
 ## 适用场景与方案选择
 
@@ -91,8 +95,8 @@ KV Cache Service 将这部分计算结果转换为可复用的缓存制品：
 
 | 场景 | 推荐方案 | 说明 |
 |---|---|---|
-| 功能验证、单机低并发、显式缓存 ID | 本仓库 Transformers backend | 已实现 |
-| 私有化生产、多 GPU、高并发、分层存储 | vLLM + LMCache | 参见 [`deploy/`](deploy/README.md) |
+| 功能验证、单机低并发、原始 KV 落盘 | Transformers backend | `KVCACHE_BACKEND=transformers` |
+| 私有化生产、多 GPU、高并发、分层存储 | vLLM backend + LMCache MP | 参见 [`deploy/`](deploy/README.md) |
 | 已有私有推理平台 | 自定义 `KVCacheBackend` | 复用本项目 HTTP 契约 |
 | 公有云模型 API | 逻辑缓存 backend | 映射厂商 Prompt Cache 语义 |
 | 短输入或低前缀复用率 | 普通推理 | 缓存加载成本可能高于重算 |
@@ -103,14 +107,17 @@ KV Cache Service 将这部分计算结果转换为可复用的缓存制品：
 
 ```mermaid
 flowchart LR
-    C["Client / SDK"] --> A["FastAPI API"]
-    A --> B["KVCacheBackend"]
-    B --> T["Transformers backend"]
-    B -. "custom adapter" .-> V["Private inference engine"]
-    B -. "logical cache adapter" .-> P["Cloud provider API"]
-    T --> M["Local / private model"]
+    C["Client / SDK"] --> A["Async FastAPI gateway"]
+    A --> L["Tenant auth + admission"]
+    L --> B["KVCacheBackend"]
+    B --> T["Transformers reference"]
     T --> S["Atomic safetensors store"]
-    S --> D["CPU memory / NVMe disk"]
+    B --> R["Cache-affine replica router"]
+    R --> V0["vLLM replica 0"]
+    R --> V1["vLLM replica 1..N"]
+    A --> D["Redis logical index"]
+    V0 --> M["LMCache MP tiers"]
+    V1 --> M
 ```
 
 HTTP 层仅依赖 `KVCacheBackend` 抽象，不直接依赖 Transformers。替换 backend 时，缓存管理
@@ -191,6 +198,17 @@ docker compose up --build
 该 Compose 配置用于 CPU 功能演示。GPU 部署应使用与宿主 CUDA 版本匹配的 PyTorch、vLLM
 或厂商基础镜像，不应直接把演示镜像用于生产环境。
 
+### 方式三：多 GPU 生产拓扑
+
+```bash
+cp .env.production.example .env.production
+# 填写模型、固定镜像版本、Redis 密码和租户密钥
+docker compose --env-file .env.production -f compose.production.yaml up -d --build
+```
+
+该拓扑启动无 Torch 依赖的网关、Redis、LMCache MP 和两个 vLLM GPU 副本。完整的版本固定、
+容量规划与 Kubernetes 部署流程见 [`deploy/README.md`](deploy/README.md)。
+
 ### 验证服务
 
 ```bash
@@ -201,6 +219,9 @@ curl http://localhost:8080/health
 
 - OpenAPI 文档：`http://localhost:8080/docs`
 - OpenAPI Schema：`http://localhost:8080/openapi.json`
+- 存活探针：`http://localhost:8080/livez`
+- 就绪探针：`http://localhost:8080/readyz`
+- Prometheus：`http://localhost:8080/metrics`
 
 ## 使用方式
 
@@ -242,6 +263,15 @@ curl -X POST http://localhost:8080/v1/completions \
 
 不传 `kv_cache_id` 时，`/v1/completions` 会执行普通 Completion。
 
+启用流式输出时设置 `"stream": true`，服务返回 OpenAI 风格 SSE，并在终止事件中附带
+usage：
+
+```bash
+curl -N http://localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"介绍一下 KV Cache","max_tokens":128,"stream":true}'
+```
+
 ### 3. 使用完整 Prompt
 
 默认 `prompt_mode=suffix`，即 `prompt` 仅包含缓存前缀之后的新增内容。如果调用方持有完整
@@ -266,9 +296,9 @@ curl -X POST http://localhost:8080/v1/completions \
 > `prefix` 与 `suffix` 的结果不一定等同于一次性编码 `prefix + suffix`，尤其是在前缀末尾
 > 没有空格、换行或模板边界时。
 
-### 4. 启用 API Key
+### 4. 启用租户鉴权
 
-设置环境变量：
+单租户兼容模式可设置：
 
 ```bash
 export KVCACHE_API_KEY='replace-with-a-strong-secret'
@@ -286,21 +316,35 @@ Authorization: Bearer replace-with-a-strong-secret
 X-API-Key: replace-with-a-strong-secret
 ```
 
-`/health` 保持公开，以便容器编排和负载均衡器执行存活探测。
+多租户模式使用 tenant 到密钥的 JSON 映射，并在每次请求中同时发送租户头：
+
+```bash
+export KVCACHE_API_KEYS='{"tenant-a":"secret-a","tenant-b":"secret-b"}'
+curl -H 'X-Tenant-ID: tenant-a' -H 'Authorization: Bearer secret-a' \
+  http://localhost:8080/v1/kv-caches
+```
+
+同一前缀在不同租户下生成不同 `cache_id`，所有查询、删除和统计也按租户隔离。`/livez`、
+`/readyz`、`/health` 和 `/metrics` 保持公开以供编排与监控；应通过网络策略限制这些端点。
+管理员状态接口需要单独的 `KVCACHE_ADMIN_API_KEY`。
 
 ## API 概览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/health` | 返回服务、backend、模型及缓存策略状态 |
+| `GET` | `/livez` | 进程存活探针，不访问后端 |
+| `GET` | `/readyz` | 检查 draining 状态和可用推理副本 |
+| `GET` | `/health` | 返回 backend、模型和逐副本状态 |
+| `GET` | `/metrics` | Prometheus 指标 |
 | `GET` | `/v1/models` | 返回 OpenAI 风格模型列表 |
-| `POST` | `/v1/kv-caches` | 分块执行 prefill 并持久化公共前缀 |
+| `GET` | `/v1/admin/status` | 管理员可见的后端、缓存和限流状态 |
+| `POST` | `/v1/kv-caches` | 创建/预热公共前缀 |
 | `GET` | `/v1/kv-caches` | 列出有效缓存 |
 | `GET` | `/v1/kv-caches/stats` | 返回缓存数量、逻辑大小、磁盘占用及治理配置 |
 | `POST` | `/v1/kv-caches/prune` | 清理过期或超出容量限制的缓存 |
 | `GET` | `/v1/kv-caches/{id}` | 查询指定缓存元数据 |
 | `DELETE` | `/v1/kv-caches/{id}` | 删除指定缓存 |
-| `POST` | `/v1/completions` | 执行普通生成或从指定缓存继续生成 |
+| `POST` | `/v1/completions` | 普通/缓存续推；支持 `stream=true` SSE |
 
 API 使用 Pydantic 严格校验请求字段。服务错误采用稳定结构返回：
 
@@ -389,6 +433,20 @@ FP16、batch size 为 1 的 GQA 模型为例，理论占用约为 56 KiB/token�
 | `KVCACHE_DEFAULT_CHUNK_SIZE` | `512` | 默认 prefill 分块 token 数 |
 | `KVCACHE_MAX_NEW_TOKENS` | `2048` | 单次请求允许生成的最大 token 数 |
 | `KVCACHE_API_KEY` | 空 | `/v1/*` 路由的可选鉴权密钥 |
+| `KVCACHE_API_KEYS` | 空 | tenant 到 API key 的 JSON 映射；启用多租户鉴权 |
+| `KVCACHE_ADMIN_API_KEY` | 空 | `/v1/admin/*` 的独立密钥 |
+| `KVCACHE_TENANT_HEADER` | `X-Tenant-ID` | 租户标识请求头 |
+| `KVCACHE_REQUEST_TIMEOUT_SECONDS` | `600` | 单请求与流式会话截止时间 |
+| `KVCACHE_ADMISSION_QUEUE_TIMEOUT_SECONDS` | `5` | 准入排队超时 |
+| `KVCACHE_MAX_CONCURRENT_REQUESTS` | `256` | 网关全局在途上限 |
+| `KVCACHE_MAX_CONCURRENT_PER_TENANT` | `32` | 单租户在途上限 |
+| `KVCACHE_RATE_LIMIT_TOKENS_PER_MINUTE` | `0` | 单租户 token 预算；`0` 为关闭 |
+| `KVCACHE_REDIS_URL` | 空 | 多网关共享逻辑索引；空值使用 SQLite |
+| `KVCACHE_VLLM_ENDPOINTS` | `http://127.0.0.1:8000` | 逗号分隔的 vLLM endpoint |
+| `KVCACHE_VLLM_API_KEY` | 空 | 网关访问 vLLM 的 Bearer key |
+| `KVCACHE_VLLM_MAX_RETRIES` | `1` | 非流式请求跨副本重试次数 |
+| `KVCACHE_VLLM_CIRCUIT_BREAKER_FAILURES` | `3` | 打开逐副本断路器的连续失败数 |
+| `KVCACHE_METRICS_ENABLED` | `true` | 是否挂载 `/metrics` |
 | `KVCACHE_HOST` | `0.0.0.0` | HTTP 监听地址 |
 | `KVCACHE_PORT` | `8080` | HTTP 监听端口 |
 | `KVCACHE_LOG_LEVEL` | `info` | Uvicorn 日志级别 |
@@ -466,12 +524,13 @@ kvcache-server
 
 ## 生产部署
 
-高并发生产环境不建议由应用层显式传输大型 K/V 文件。更合适的架构是：
+0.3 内置 `vllm` backend，生产环境不再由应用层显式传输大型 K/V 文件。其职责边界为：
 
 - 使用 vLLM 管理 GPU 内 KV block 和 Automatic Prefix Caching；
-- 使用 LMCache 将缓存扩展至 GPU、CPU、NVMe 或远端存储；
-- 由推理引擎根据相同 token block 自动匹配前缀；
-- 继续通过 OpenAI-compatible API 对外提供服务。
+- 使用 LMCache MP 将缓存扩展至 CPU、NVMe 或远端存储；
+- 网关保存租户隔离的逻辑前缀，并以缓存亲和、负载和延迟选择副本；
+- Redis 在多个网关之间共享逻辑索引、TTL 和防重复预热锁；
+- 通过准入控制、重试、熔断、探针和优雅退出保护数据平面。
 
 参考配置与启动命令见 [`deploy/README.md`](deploy/README.md)。上线前应固定 vLLM、CUDA、
 PyTorch 与 LMCache 的兼容版本，不应在生产环境使用浮动的 `latest` 依赖。
@@ -508,7 +567,9 @@ python -m build
 - 无后缀情况下从已保存 logits 继续生成；
 - SHA-256 校验和损坏检测；
 - TTL、LRU 配额和主动清理；
-- API Key 鉴权及稳定错误结构。
+- 多租户鉴权、隔离及稳定错误结构；
+- 异步 SSE、vLLM 协议映射、缓存亲和与健康检查；
+- Redis 共享索引、分布式预热锁、并发和 token 准入控制。
 
 GitHub Actions 会在推送和 Pull Request 时执行 Ruff、测试及 wheel 构建。
 
@@ -521,6 +582,12 @@ python scripts/benchmark.py ./long-document.txt --runs 3 --max-tokens 64
 建议重点比较输出中的 `cache_load`、`prefill` 和 `total`，并使用多种前缀长度与复用次数进行
 评估。
 
+生产链路可使用并发脚本记录 TTFT、P95/P99、请求吞吐和输出 token 吞吐：
+
+```bash
+python scripts/load_test.py --requests 500 --concurrency 64 --max-tokens 128
+```
+
 ## 项目结构
 
 ```text
@@ -529,6 +596,12 @@ kvcache-service/
 │   ├── app.py                  # FastAPI 路由、鉴权与错误处理
 │   ├── backend.py              # Backend 抽象与动态加载
 │   ├── transformers_backend.py # Transformers 参考实现
+│   ├── vllm_backend.py         # 异步多副本 vLLM 数据平面
+│   ├── router.py               # 缓存亲和、负载反馈与熔断
+│   ├── admission.py            # 并发与 token 准入控制
+│   ├── logical_store.py        # SQLite 逻辑缓存索引
+│   ├── redis_store.py          # Redis 共享索引与分布式锁
+│   ├── metrics.py              # Prometheus 指标
 │   ├── store.py                # safetensors 持久化与容量治理
 │   ├── cache_codec.py          # K/V 张量编码与恢复
 │   ├── api_models.py           # API 请求与响应模型
@@ -537,18 +610,22 @@ kvcache-service/
 ├── examples/                   # 自定义 Backend 示例
 ├── docs/                       # 扩展文档
 ├── deploy/                     # vLLM + LMCache 生产化参考
-├── scripts/benchmark.py        # 冷/热路径性能基准
+├── scripts/                    # 冷/热路径基准及并发负载测试
+├── deploy/kubernetes/          # 网关、vLLM、LMCache Operator 示例
 ├── compose.yaml                # CPU 演示环境
-├── Dockerfile                  # 服务镜像
+├── compose.production.yaml     # 双 GPU 生产参考拓扑
+├── Dockerfile.gateway          # 无 Torch 网关镜像
+├── Dockerfile                  # Transformers 演示镜像
 └── pyproject.toml              # Python 包及工具配置
 ```
 
 ## 相关资料
 
 - [Transformers cache strategies](https://huggingface.co/docs/transformers/kv_cache)
-- [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/)
+- [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/stable/features/automatic_prefix_caching/)
+- [vLLM parallelism and scaling](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)
 - [LMCache architecture](https://docs.lmcache.ai/developer_guide/architecture.html)
-- [LMCache local storage](https://docs.lmcache.ai/kv_cache/storage_backends/local_storage.html)
+- [LMCache MP deployment](https://docs.lmcache.ai/mp/deployment.html)
 
 ## 许可证
 

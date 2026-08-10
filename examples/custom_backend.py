@@ -5,7 +5,7 @@ Put real credentials in environment variables or a secret manager, never in cach
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from kvcache_service.backend import KVCacheBackend
 from kvcache_service.config import Settings
@@ -32,13 +32,16 @@ class CustomBackend(KVCacheBackend):
         # 2. Cloud API: store a logical prefix and provider-side cache key.
         raise NotImplementedError("Map cache creation to the target provider")
 
-    def get_cache(self, cache_id: str) -> CacheInfo:
+    def get_cache(self, cache_id: str, tenant_id: str = "default") -> CacheInfo:
+        del tenant_id
         raise NotImplementedError("Read cache metadata from the target provider or DB")
 
-    def list_caches(self) -> List[CacheInfo]:
+    def list_caches(self, tenant_id: Optional[str] = None) -> List[CacheInfo]:
+        del tenant_id
         raise NotImplementedError("List provider or DB cache records")
 
-    def delete_cache(self, cache_id: str) -> bool:
+    def delete_cache(self, cache_id: str, tenant_id: str = "default") -> bool:
+        del tenant_id
         raise NotImplementedError("Delete or invalidate the provider-side cache")
 
     def complete(self, command: CompletionCommand) -> CompletionResult:

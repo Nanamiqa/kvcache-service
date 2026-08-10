@@ -184,7 +184,7 @@ class SafeTensorCacheStore:
         except TypeError as exc:
             raise KVCacheError("Cache metadata contains invalid values") from exc
 
-    def get_info(self, cache_id: str) -> CacheInfo:
+    def get_info(self, cache_id: str, tenant_id: Optional[str] = None) -> CacheInfo:
         with self._guard():
             try:
                 payload = self._metadata_unlocked(cache_id)
@@ -194,9 +194,14 @@ class SafeTensorCacheStore:
                     shutil.rmtree(directory)
                 self._verified_files.pop(cache_id, None)
                 raise
-            return self._info_from_payload(payload)
+            info = self._info_from_payload(payload)
+            if tenant_id is not None and info.tenant_id != tenant_id:
+                raise CacheNotFoundError(f"Cache {cache_id!r} does not exist")
+            return info
 
-    def load(self, cache_id: str) -> Tuple[CacheInfo, Dict[str, Any]]:
+    def load(
+        self, cache_id: str, tenant_id: Optional[str] = None
+    ) -> Tuple[CacheInfo, Dict[str, Any]]:
         with self._guard():
             directory, _, tensor_path = self._paths(cache_id)
             try:
@@ -206,6 +211,9 @@ class SafeTensorCacheStore:
                     shutil.rmtree(directory)
                 self._verified_files.pop(cache_id, None)
                 raise
+            info = self._info_from_payload(payload)
+            if tenant_id is not None and info.tenant_id != tenant_id:
+                raise CacheNotFoundError(f"Cache {cache_id!r} does not exist")
             if not tensor_path.is_file():
                 raise CacheNotFoundError(f"Tensor file for cache {cache_id!r} does not exist")
             if self.verify_checksum:
@@ -222,9 +230,9 @@ class SafeTensorCacheStore:
                     self._verified_files[cache_id] = signature
             tensors = load_file(str(tensor_path), device="cpu")
             os.utime(directory, None)
-            return self._info_from_payload(payload), tensors
+            return info, tensors
 
-    def list(self) -> List[CacheInfo]:
+    def list(self, tenant_id: Optional[str] = None) -> List[CacheInfo]:
         self.prune()
         infos: List[CacheInfo] = []
         with self._guard():
@@ -232,16 +240,22 @@ class SafeTensorCacheStore:
                 if not candidate.is_dir() or not _CACHE_ID.fullmatch(candidate.name):
                     continue
                 try:
-                    infos.append(self._info_from_payload(self._metadata_unlocked(candidate.name)))
+                    info = self._info_from_payload(self._metadata_unlocked(candidate.name))
+                    if tenant_id is None or info.tenant_id == tenant_id:
+                        infos.append(info)
                 except KVCacheError:
                     continue
         return sorted(infos, key=lambda item: item.created_at, reverse=True)
 
-    def delete(self, cache_id: str) -> bool:
+    def delete(self, cache_id: str, tenant_id: Optional[str] = None) -> bool:
         directory, _, _ = self._paths(cache_id)
         with self._guard():
             if not directory.exists():
                 return False
+            if tenant_id is not None:
+                info = self._info_from_payload(self._metadata_unlocked(cache_id))
+                if info.tenant_id != tenant_id:
+                    return False
             shutil.rmtree(directory)
             self._verified_files.pop(cache_id, None)
             return True
@@ -288,7 +302,7 @@ class SafeTensorCacheStore:
         with self._guard():
             return self._prune_unlocked()
 
-    def _stats_unlocked(self) -> Dict[str, int]:
+    def _stats_unlocked(self, tenant_id: Optional[str] = None) -> Dict[str, int]:
         cache_count = 0
         tensor_bytes = 0
         disk_bytes = 0
@@ -298,6 +312,8 @@ class SafeTensorCacheStore:
             try:
                 info = self._info_from_payload(self._metadata_unlocked(directory.name))
             except KVCacheError:
+                continue
+            if tenant_id is not None and info.tenant_id != tenant_id:
                 continue
             cache_count += 1
             tensor_bytes += info.tensor_bytes
@@ -310,7 +326,7 @@ class SafeTensorCacheStore:
             "ttl_seconds": self.ttl_seconds,
         }
 
-    def stats(self) -> Dict[str, int]:
+    def stats(self, tenant_id: Optional[str] = None) -> Dict[str, int]:
         self.prune()
         with self._guard():
-            return self._stats_unlocked()
+            return self._stats_unlocked(tenant_id)

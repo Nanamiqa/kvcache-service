@@ -40,6 +40,9 @@ class CacheInfoResponse(StrictModel):
     created_at: str
     chunk_size: int
     expires_at: Optional[str] = None
+    tenant_id: str = "default"
+    affinity_key: Optional[str] = None
+    storage: str = "safetensors"
 
 
 class CacheListResponse(StrictModel):
@@ -74,8 +77,6 @@ class CompletionRequest(StrictModel):
             raise ValueError("Only one of prompt or input_ids may be supplied")
         if self.kv_cache_id is None and self.prompt is None and self.input_ids is None:
             raise ValueError("prompt or input_ids is required when kv_cache_id is absent")
-        if self.stream:
-            raise ValueError("Streaming is not implemented by the reference backend")
         if any(stop == "" for stop in self.normalized_stop()):
             raise ValueError("stop strings must not be empty")
         if any(token_id < 0 for token_id in self.stop_token_ids):

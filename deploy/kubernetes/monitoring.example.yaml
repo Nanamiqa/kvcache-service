@@ -1,0 +1,15 @@
+# Requires the Prometheus Operator. Match `release` to your Prometheus selector.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kvcache-gateway
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kvcache-gateway
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

@@ -50,6 +50,38 @@ class ApiTest(unittest.TestCase):
         authorized = protected.get("/v1/models", headers={"Authorization": "Bearer test-secret"})
         self.assertEqual(authorized.status_code, 200)
 
+    def test_streaming_completion_uses_sse_contract(self) -> None:
+        with self.client.stream(
+            "POST", "/v1/completions", json={"prompt": "question", "stream": True}
+        ) as response:
+            body = "".join(response.iter_text())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"text": "done"', body)
+        self.assertIn("data: [DONE]", body)
+
+    def test_tenant_keys_isolate_cache_lifecycle(self) -> None:
+        settings = Settings(api_keys={"alpha": "alpha-key", "beta": "beta-key"})
+        client = TestClient(create_app(settings, FakeBackend()))
+        alpha_headers = {"X-Tenant-ID": "alpha", "Authorization": "Bearer alpha-key"}
+        beta_headers = {"X-Tenant-ID": "beta", "Authorization": "Bearer beta-key"}
+        created = client.post("/v1/kv-caches", json={"text": "secret"}, headers=alpha_headers)
+        self.assertEqual(created.status_code, 201)
+        cache_id = created.json()["cache_id"]
+        beta_read = client.get(f"/v1/kv-caches/{cache_id}", headers=beta_headers)
+        alpha_read = client.get(f"/v1/kv-caches/{cache_id}", headers=alpha_headers)
+        self.assertEqual(beta_read.status_code, 404)
+        self.assertEqual(alpha_read.status_code, 200)
+
+    def test_admin_status_requires_separate_key(self) -> None:
+        client = TestClient(
+            create_app(Settings(api_key="tenant-key", admin_api_key="admin-key"), FakeBackend())
+        )
+        tenant = client.get("/v1/admin/status", headers={"Authorization": "Bearer tenant-key"})
+        admin = client.get("/v1/admin/status", headers={"X-Admin-Key": "admin-key"})
+        self.assertEqual(tenant.status_code, 401)
+        self.assertEqual(admin.status_code, 200)
+        self.assertIn("limits", admin.json())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,9 +18,13 @@ from .errors import CacheCompatibilityError, ContextLengthError, KVCacheError
 from .store import SafeTensorCacheStore
 
 
-def _hash_tokens(model_fingerprint: str, token_ids: Sequence[int]) -> Tuple[str, str]:
+def _hash_tokens(
+    model_fingerprint: str, token_ids: Sequence[int], tenant_id: str = "default"
+) -> Tuple[str, str]:
     prefix_digest = hashlib.sha256()
     cache_digest = hashlib.sha256(model_fingerprint.encode("utf-8"))
+    cache_digest.update(b"\0")
+    cache_digest.update(tenant_id.encode("utf-8"))
     cache_digest.update(b"\0")
     for token_id in token_ids:
         encoded = int(token_id).to_bytes(8, byteorder="little", signed=True)
@@ -274,7 +278,9 @@ class TransformersBackend(KVCacheBackend):
         else:
             raise KVCacheError("Exactly one of text or input_ids is required")
         self._check_context(len(token_ids))
-        prefix_sha256, cache_id = _hash_tokens(self._model_fingerprint, token_ids)
+        prefix_sha256, cache_id = _hash_tokens(
+            self._model_fingerprint, token_ids, command.tenant_id
+        )
         if self.store.exists(cache_id):
             return self.store.get_info(cache_id)
 
@@ -300,22 +306,24 @@ class TransformersBackend(KVCacheBackend):
                 tensor_bytes=tensor_bytes,
                 created_at=datetime.now(timezone.utc).isoformat(),
                 chunk_size=command.chunk_size,
+                tenant_id=command.tenant_id,
             )
             return self.store.save(info, tensors)
 
-    def get_cache(self, cache_id: str) -> CacheInfo:
-        return self.store.get_info(cache_id)
+    def get_cache(self, cache_id: str, tenant_id: str = "default") -> CacheInfo:
+        return self.store.get_info(cache_id, tenant_id)
 
-    def list_caches(self) -> List[CacheInfo]:
-        return self.store.list()
+    def list_caches(self, tenant_id: Optional[str] = None) -> List[CacheInfo]:
+        return self.store.list(tenant_id)
 
-    def delete_cache(self, cache_id: str) -> bool:
-        return self.store.delete(cache_id)
+    def delete_cache(self, cache_id: str, tenant_id: str = "default") -> bool:
+        return self.store.delete(cache_id, tenant_id)
 
-    def cache_stats(self) -> Dict[str, int]:
-        return self.store.stats()
+    def cache_stats(self, tenant_id: Optional[str] = None) -> Dict[str, int]:
+        return self.store.stats(tenant_id)
 
-    def prune_caches(self) -> Dict[str, int]:
+    def prune_caches(self, tenant_id: Optional[str] = None) -> Dict[str, int]:
+        del tenant_id
         return self.store.prune()
 
     def _eos_ids(self) -> List[int]:
@@ -414,7 +422,7 @@ class TransformersBackend(KVCacheBackend):
             prefill_ms = 0.0
             if command.cache_id:
                 load_started = time.perf_counter()
-                info, tensors = self.store.load(command.cache_id)
+                info, tensors = self.store.load(command.cache_id, command.tenant_id)
                 if info.model_fingerprint != self._model_fingerprint:
                     raise CacheCompatibilityError(
                         "Cache was built by a different model revision, tokenizer, or dtype"

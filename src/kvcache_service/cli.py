@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import uvicorn
 
 from .app import create_app
@@ -15,6 +17,8 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level,
+        proxy_headers=True,
+        timeout_graceful_shutdown=math.ceil(settings.shutdown_grace_seconds),
     )
 
 

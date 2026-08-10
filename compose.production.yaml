@@ -1,0 +1,191 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    ports:
+      - "8080:8080"
+    environment:
+      KVCACHE_BACKEND: vllm
+      KVCACHE_MODEL: ${KVCACHE_MODEL:?Set KVCACHE_MODEL}
+      KVCACHE_MODEL_REVISION: ${KVCACHE_MODEL_REVISION:?Set immutable model revision}
+      KVCACHE_MODEL_FINGERPRINT: ${KVCACHE_MODEL_FINGERPRINT:?Set release or weight hash}
+      KVCACHE_VLLM_ENDPOINTS: http://vllm-0:8000,http://vllm-1:8000
+      KVCACHE_VLLM_API_KEY: ${VLLM_API_KEY:?Set internal vLLM API key}
+      KVCACHE_LMCACHE_CONTROLLER_URL: http://lmcache:8080
+      KVCACHE_REDIS_URL: redis://:${REDIS_PASSWORD:?Set Redis password}@redis:6379/0
+      KVCACHE_API_KEYS: ${KVCACHE_API_KEYS:?Set tenant API key JSON}
+      KVCACHE_ADMIN_API_KEY: ${KVCACHE_ADMIN_API_KEY:?Set admin API key}
+      KVCACHE_CACHE_TTL_SECONDS: ${KVCACHE_CACHE_TTL_SECONDS:-86400}
+      KVCACHE_MAX_CONCURRENT_REQUESTS: ${KVCACHE_MAX_CONCURRENT_REQUESTS:-512}
+      KVCACHE_MAX_CONCURRENT_PER_TENANT: ${KVCACHE_MAX_CONCURRENT_PER_TENANT:-32}
+      KVCACHE_RATE_LIMIT_TOKENS_PER_MINUTE: ${KVCACHE_RATE_LIMIT_TOKENS_PER_MINUTE:-0}
+      KVCACHE_RATE_LIMIT_BURST_TOKENS: ${KVCACHE_RATE_LIMIT_BURST_TOKENS:-0}
+    volumes:
+      - gateway-index:/data/kvcache
+    depends_on:
+      redis:
+        condition: service_healthy
+      vllm-0:
+        condition: service_healthy
+      vllm-1:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: ${REDIS_IMAGE:?Pin a Redis image or digest}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set Redis password}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a '$$REDIS_PASSWORD' ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set Redis password}
+    restart: unless-stopped
+
+  lmcache:
+    image: ${LMCACHE_SERVER_IMAGE:?Pin an lmcache/standalone image or digest}
+    command:
+      - /opt/venv/bin/lmcache
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5555"
+      - --http-port
+      - "8080"
+      - --l1-size-gb
+      - ${LMCACHE_L1_SIZE_GB:-100}
+      - --eviction-policy
+      - LRU
+      - --max-workers
+      - ${LMCACHE_MAX_WORKERS:-4}
+      - --max-gpu-workers
+      - ${LMCACHE_MAX_GPU_WORKERS:-2}
+    ipc: host
+    volumes:
+      - lmcache-data:/var/lib/lmcache
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://localhost:8080/healthcheck', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  vllm-0:
+    image: ${LMCACHE_VLLM_IMAGE:?Pin an lmcache/vllm-openai image or digest}
+    command:
+      - ${KVCACHE_MODEL:?Set KVCACHE_MODEL}
+      - --revision
+      - ${KVCACHE_MODEL_REVISION:?Set immutable model revision}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${VLLM_API_KEY:?Set internal vLLM API key}
+      - --enable-prefix-caching
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-32768}
+      - --max-num-batched-tokens
+      - ${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      - --kv-transfer-config
+      - >-
+        {"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"lmcache","lmcache.mp.port":5555}}
+    ipc: host
+    depends_on:
+      lmcache:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://localhost:8000/health', timeout=3)
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+
+  vllm-1:
+    image: ${LMCACHE_VLLM_IMAGE:?Pin an lmcache/vllm-openai image or digest}
+    command:
+      - ${KVCACHE_MODEL:?Set KVCACHE_MODEL}
+      - --revision
+      - ${KVCACHE_MODEL_REVISION:?Set immutable model revision}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${VLLM_API_KEY:?Set internal vLLM API key}
+      - --enable-prefix-caching
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-32768}
+      - --max-num-batched-tokens
+      - ${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      - --kv-transfer-config
+      - >-
+        {"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"lmcache","lmcache.mp.port":5555}}
+    ipc: host
+    depends_on:
+      lmcache:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://localhost:8000/health', timeout=3)
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+
+volumes:
+  gateway-index:
+  lmcache-data:
+  redis-data:

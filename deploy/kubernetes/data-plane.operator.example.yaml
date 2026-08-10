@@ -1,0 +1,177 @@
+# Requires the LMCache Operator CRDs. Apply the LMCacheEngine first and wait for
+# its generated `lmcache-connection` ConfigMap before applying the StatefulSet.
+apiVersion: lmcache.lmcache.ai/v1alpha1
+kind: LMCacheEngine
+metadata:
+  name: lmcache
+spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  image:
+    repository: REPLACE_ME/lmcache-standalone
+    tag: PINNED_VERSION
+    pullPolicy: IfNotPresent
+  server:
+    port: 5555
+    chunkSize: 256
+    maxWorkers: 4
+  l1:
+    sizeGB: 60
+  eviction:
+    policy: LRU
+    triggerWatermark: 0.8
+    evictionRatio: 0.2
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      labels:
+        release: kube-prometheus-stack
+  resourceOverrides:
+    requests:
+      cpu: "4"
+      memory: 65Gi
+    limits:
+      memory: 96Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-headless
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm
+spec:
+  serviceName: vllm-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8000"
+    spec:
+      # LMCache MP uses CUDA IPC with the node-local engine. The namespace must
+      # be allowed by the cluster's Pod Security policy.
+      hostIPC: true
+      terminationGracePeriodSeconds: 120
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: vllm
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: REPLACE_ME/lmcache-vllm-openai:PINNED_VERSION
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --model "${KVCACHE_MODEL}" \
+                --revision "${KVCACHE_MODEL_REVISION}" \
+                --host 0.0.0.0 \
+                --port 8000 \
+                --api-key "${VLLM_API_KEY}" \
+                --enable-prefix-caching \
+                --max-model-len 32768 \
+                --max-num-batched-tokens 8192 \
+                --gpu-memory-utilization 0.9 \
+                --kv-transfer-config "$(cat /etc/lmcache/kv-transfer-config.json)"
+          env:
+            - name: KVCACHE_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: kvcache-gateway
+                  key: KVCACHE_MODEL
+            - name: KVCACHE_MODEL_REVISION
+              valueFrom:
+                configMapKeyRef:
+                  name: kvcache-gateway
+                  key: KVCACHE_MODEL_REVISION
+            - name: VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kvcache-gateway-secrets
+                  key: KVCACHE_VLLM_API_KEY
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kvcache-gateway-secrets
+                  key: HF_TOKEN
+            - name: PYTHONHASHSEED
+              value: "0"
+          ports:
+            - name: http
+              containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 30"]
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: lmcache-connection
+              mountPath: /etc/lmcache
+              readOnly: true
+      volumes:
+        - name: lmcache-connection
+          configMap:
+            name: lmcache-connection
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
