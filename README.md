@@ -11,6 +11,8 @@
 
 </div>
 
+项目技术报告：[《KV Cache Service 技术报告：从推理中间态到企业知识资产》](<KV Cache Service 技术报告：从推理中间态到企业知识资产.pdf>)
+
 KV Cache Service 是面向重复长前缀推理的缓存控制面与推理网关。0.3 版本提供两条运行路径：
 
 - `transformers`：将每层 Key/Value 张量以 safetensors 持久化，适用于单机语义验证、研究和
